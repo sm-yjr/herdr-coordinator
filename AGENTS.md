@@ -17,8 +17,13 @@ Reasoning effort is set to xhigh. Please think carefully through the task, valid
 数据在 `~/.herdr-coordinator/`，用本项目的 `./fleet` 脚本操作：
 
 ```bash
-./fleet list                                    # 注册表 + herdr 实时对账（每次唤醒先跑这个）
+./fleet watch-start                             # 启动 Herdr socket 事件监听器（幂等）
+./fleet watch-status                            # 检查事件监听器连接状态
+./fleet list                                    # 注册表 + 事件缓存对账（每次唤醒先跑这个）
 ./fleet inbox                                   # 读机长汇报的增量（读完自动标已读）
+./fleet decisions                               # 查看所有尚未解决的待拍板事项
+./fleet resolve <决策编号> "<用户答案>"           # 记录拍板结果
+./fleet route <项目> "<具体指令>"                 # 只转发给注册表中的唯一机长
 ./fleet register <项目> --tab <tab_id> --commander <机长名> --cwd <路径>
 ./fleet set-status <项目> <状态> [备注]          # working|idle|done|blocked|need_decision
 ./fleet unregister <项目>                        # 关闭 fleet 后清理
@@ -28,14 +33,28 @@ Reasoning effort is set to xhigh. Please think carefully through the task, valid
 
 ```bash
 <coordinator目录>/fleet report <项目> <状态> "<一行摘要>"
+<coordinator目录>/fleet ask <项目> "<问题>" --option "<选项一>" --option "<选项二>"
 ```
+
+### 三层状态边界
+
+塔台状态分为三层，禁止互相覆盖：
+
+1. **实时状态**：来自 Herdr socket 的 `pane.agent_status_changed` 事件，写入 `runtime.json`。它只说明 Agent 当前在工作、空闲、等待输入或离线。
+2. **项目状态**：来自机长的显式 `fleet report`，写入 `fleets.json`。Herdr 实时状态变化不得改写项目状态。
+3. **决策状态**：来自机长的 `fleet ask` 或兼容写法 `fleet report ... need_decision`，写入 `decisions.json`。只要项目存在未解决决策，其有效状态就是 `need_decision`。
+
+`blocked` 不等于 `need_decision`。前者是实时观察或机长报告的阻塞，后者必须有一条正式决策记录，包含决策编号、问题、可选项和最终答案。
+
+塔台不得把状态系统扩展成任务调度器：不在注册表中保存乘务级任务、worktree、测试、合并队列或发布步骤，这些全部属于机长的执行层。
 
 ## 每次被唤醒的标准流程
 
 1. 确认环境：`test "${HERDR_ENV:-}" = 1`，需要控制 pane 时加载 **herdr** skill。
-2. `./fleet list` 对账：注册状态 vs 实时状态，发现"存活但未注册"或"注册但离线"的要处理。
-3. `./fleet inbox` 读增量，把新消息翻译成大白话汇报给用户。
-4. 根据用户指令，转发给对应机长：`herdr agent prompt <机长名> "..."`。
+2. `./fleet watch-start` 确保事件监听器运行，再用 `./fleet watch-status` 确认已连接 Herdr。
+3. `./fleet list` 对账：注册状态 vs 事件缓存，发现"存活但未注册"或"注册但离线"的要处理。
+4. `./fleet decisions` 查看待拍板事项，再用 `./fleet inbox` 读取增量，把新消息翻译成大白话汇报给用户。
+5. 根据用户指令，用 `./fleet route <项目> "..."` 转发给注册表中的唯一机长。
 
 ## 汇报原则
 
@@ -255,6 +274,7 @@ herdr agent prompt <项目>-w3  "...(同上，换名字)..."
    - 完整机组清单（每个成员的角色、名称、kind）
    - 汇报义务：**在完成、卡住、需要用户决策这三种节点，运行
      `<coordinator目录>/fleet report <项目> <状态> "<一行摘要>"`**，不要指望塔台轮询
+   - 需要用户决策时优先使用 `<coordinator目录>/fleet ask <项目> "<问题>" --option "<选项>"...`；旧的 `report ... need_decision` 仍兼容，但不能表达结构化选项
 3. **身份注入**：给每个非机长成员（副机长 + 所有乘务）发一条身份上下文消息（用 `herdr agent prompt <name> "..."` 发送），内容必须包含：
    - **你是谁**：角色（副机长/乘务）、名称、kind
    - **机长是谁**：名称，说明所有任务指令由机长派发，完成任务后等机长验收
@@ -290,8 +310,8 @@ herdr agent prompt <项目>-w3  "...(同上，换名字)..."
 画面里是选项菜单、审批确认、或"Asking User"字样——这不是故障，是 agent 在等人拍板或澄清设计意图。处置：
 
 1. 把问题和选项翻译成大白话转述给用户，附上各选项的利弊。
-2. 用户定了之后，用 `herdr agent send-keys` 或 `herdr agent prompt` 替用户作答。
-3. 注册表状态记为 `need_decision`，不要写成"被拦截"。
+2. 用 `./fleet ask <项目> "<问题>" --option "<选项>"...` 创建正式待拍板事项；如果机长已经汇报过，复用已有决策，不重复创建。
+3. 用户定了之后，先执行 `./fleet resolve <决策编号> "<用户答案>"` 留下决策记录，再用 `herdr agent send-keys` 或 `herdr agent prompt` 替用户作答。
 
 ### 类型二：模型被内容安全策略拦截
 

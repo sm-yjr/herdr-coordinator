@@ -3,6 +3,9 @@
 # 用法: ./dashboard.sh [刷新秒数]
 
 INTERVAL=${1:-3}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+"$SCRIPT_DIR/fleet" watch-start >/dev/null
 
 trap 'tput cnorm; echo; exit 0' INT TERM
 
@@ -11,13 +14,15 @@ tput clear
 
 while true; do
   python3 << PYEOF
-import json, subprocess, datetime, sys, os, unicodedata
+import json, datetime, sys, os, unicodedata
 
 INTERVAL = ${INTERVAL}
-HOME_DIR = os.path.expanduser("~/.herdr-coordinator")
+HOME_DIR = os.environ.get("HERDR_COORDINATOR_HOME", os.path.expanduser("~/.herdr-coordinator"))
 REG_PATH = os.path.join(HOME_DIR, "fleets.json")
 INBOX_PATH = os.path.join(HOME_DIR, "inbox.jsonl")
 CURSOR_PATH = os.path.join(HOME_DIR, "inbox.cursor")
+DECISIONS_PATH = os.path.join(HOME_DIR, "decisions.json")
+RUNTIME_PATH = os.path.join(HOME_DIR, "runtime.json")
 
 # ── 宽度计算 ──
 def char_width(ch):
@@ -48,13 +53,6 @@ def pad(s, target):
     return s + ' ' * max(target - display_width(s), 0)
 
 # ── 数据获取 ──
-def run_json(args):
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=10)
-        return json.loads(r.stdout) if r.returncode == 0 else {}
-    except Exception:
-        return {}
-
 def load_json_file(path, default):
     try:
         with open(path) as f:
@@ -62,12 +60,16 @@ def load_json_file(path, default):
     except Exception:
         return default
 
-agents = run_json(["herdr", "agent", "list"]).get('result', {}).get('agents', [])
-
-# 自动同步注册表（herdr 实时状态 → 注册表 status）
-subprocess.run([sys.executable, "fleet", "sync"], capture_output=True, timeout=10)
-
 registry = load_json_file(REG_PATH, {})
+runtime = load_json_file(RUNTIME_PATH, {})
+agents = runtime.get('agents', []) if runtime.get('connected') else []
+decision_records = load_json_file(DECISIONS_PATH, [])
+decisions = [d for d in decision_records if d.get('state') == 'open']
+
+def project_status(project, entry):
+    if any(d.get('project') == project for d in decisions):
+        return 'need_decision'
+    return entry.get('reported_status', entry.get('status', 'unknown'))
 
 inbox = []
 try:
@@ -150,25 +152,29 @@ now = datetime.datetime.now().strftime('%H:%M:%S')
 working = sum(1 for a in agents if a.get('agent_status') == 'working')
 blocked = sum(1 for a in agents if a.get('agent_status') == 'blocked')
 unread_cnt = sum(1 for e in inbox if e['_unread'])
-decisions = [(p, e) for p, e in registry.items() if e.get('status') == 'need_decision']
-
 lines_out = [top()]
+live_label = f'agent {len(agents)} · 🔴{working} · 🟡{blocked}'
+if not runtime.get('connected'):
+    live_label = '⚠ 事件监听未连接'
 lines_out.append(L2(f'🗼 塔台看板  {now}',
-                    f'agent {len(agents)} · 🔴{working} · 🟡{blocked}'))
+                    live_label))
 
 # 待拍板置顶
 if decisions:
     lines_out.append(mid())
     lines_out.append(L('🙋 等你拍板：'))
-    for p, e in decisions:
-        lines_out.append(L(f'   {p} — {e.get("note","")}  ({ago(e.get("updated_at",""))})'))
+    for d in decisions[:5]:
+        opts = ' / '.join(d.get('options', []))
+        suffix = f'  选项: {opts}' if opts else ''
+        lines_out.append(L(f'   {d.get("project","?")} — {d.get("question","")}{suffix}  '
+                           f'({ago(d.get("created_at",""))})'))
 
 # 项目区
 lines_out.append(mid())
 if not registry:
     lines_out.append(L('（注册表为空 — 还没有登记任何项目 fleet）'))
 for proj, e in registry.items():
-    st = e.get('status', 'unknown')
+    st = project_status(proj, e)
     header = f'📂 {proj}  {status_icon(st)}{status_text(st)}'
     note = e.get('note', '')
     if note and st != 'need_decision':

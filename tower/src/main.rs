@@ -43,6 +43,8 @@ struct FleetEntry {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
+    reported_status: Option<String>,
+    #[serde(default)]
     note: Option<String>,
     #[serde(default)]
     updated_at: Option<String>,
@@ -62,6 +64,34 @@ struct AgentInfo {
     pane_id: Option<String>,
     #[serde(default)]
     terminal_title_stripped: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RuntimeFile {
+    #[serde(default)]
+    connected: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    agents: Vec<AgentInfo>,
+}
+
+#[derive(Deserialize, Clone)]
+struct DecisionEntry {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    options: Vec<String>,
+    #[serde(default)]
+    created_at: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -109,6 +139,7 @@ struct Project {
 
 struct App {
     projects: Vec<Project>,
+    decisions: Vec<DecisionEntry>,
     tower_staff: Vec<(String, String, Option<String>)>,
     orphans: Vec<(String, String)>,
     inbox: Vec<InboxEntry>,
@@ -161,7 +192,9 @@ fn status_label(s: &str) -> &'static str {
 
 fn ago(ts: &str) -> String {
     if let Ok(t) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
-        let sec = (chrono::Local::now().naive_local() - t).num_seconds().max(0);
+        let sec = (chrono::Local::now().naive_local() - t)
+            .num_seconds()
+            .max(0);
         return match sec {
             0..=59 => format!("{}s", sec),
             60..=3599 => format!("{}m", sec / 60),
@@ -179,49 +212,45 @@ fn load(app: &mut App) {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let agents: Vec<AgentInfo> = Command::new("herdr")
-        .args(["agent", "list"])
-        .output()
+    let runtime: RuntimeFile = fs::read_to_string(dir.join("runtime.json"))
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-        .and_then(|v| {
-            serde_json::from_value(v.pointer("/result/agents").cloned().unwrap_or_default()).ok()
-        })
+        .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    app.error = if agents.is_empty() {
-        Some("herdr agent list 不可用".into())
+    let agents = if runtime.connected {
+        runtime.agents
     } else {
-        None
+        Vec::new()
     };
+    app.error = if runtime.connected {
+        None
+    } else {
+        Some(
+            runtime
+                .error
+                .unwrap_or_else(|| "事件监听器未连接 Herdr".into()),
+        )
+    };
+    app.synced_at = runtime
+        .updated_at
+        .as_deref()
+        .and_then(|s| s.get(11..19))
+        .map(str::to_string);
 
-    // 自动同步：机长实时状态回写注册表。
-    // working/idle/done 直接同步；blocked 不自动定性（需人工区分提问还是被拦），
-    // 且不覆盖人工标记的 need_decision。
-    let mut dirty = false;
-    for (_, entry) in registry.iter_mut() {
-        let Some(cmd_name) = entry.commander.as_deref() else {
-            continue;
-        };
-        let live = agents
-            .iter()
-            .find(|a| a.name.as_deref() == Some(cmd_name))
-            .and_then(|a| a.agent_status.as_deref());
-        if let Some(live) = live {
-            if matches!(live, "working" | "idle" | "done")
-                && entry.status.as_deref() != Some(live)
-            {
-                entry.status = Some(live.to_string());
-                entry.updated_at = Some(now_str());
-                dirty = true;
-            }
+    app.decisions = fs::read_to_string(dir.join("decisions.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<DecisionEntry>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.state == "open")
+        .collect();
+
+    // 项目状态来自机长汇报；实时 Agent 状态只用于成员状态和离线提示。
+    for (name, entry) in registry.iter_mut() {
+        if app.decisions.iter().any(|d| d.project == *name) {
+            entry.status = Some("need_decision".into());
+        } else if let Some(reported) = &entry.reported_status {
+            entry.status = Some(reported.clone());
         }
-    }
-    if dirty {
-        if let Ok(s) = serde_json::to_string_pretty(&registry) {
-            let _ = fs::write(dir.join("fleets.json"), s);
-        }
-        app.synced_at = Some(chrono::Local::now().format("%H:%M:%S").to_string());
     }
 
     app.inbox = fs::read_to_string(dir.join("inbox.jsonl"))
@@ -303,9 +332,7 @@ fn load(app: &mut App) {
             } else if a.agent.as_deref() == Some("codex") || aname.contains("rev") {
                 "副机长".to_string()
             } else {
-                let short = aname
-                    .strip_prefix(&format!("{}-", name))
-                    .unwrap_or(aname);
+                let short = aname.strip_prefix(&format!("{}-", name)).unwrap_or(aname);
                 format!("乘务-{}", short)
             };
             members.push(Member {
@@ -346,7 +373,7 @@ fn load(app: &mut App) {
             !claimed.contains(i)
                 && a.cwd
                     .as_deref()
-                    .map_or(false, |c| c.ends_with("herdr-coordinator"))
+                    .is_some_and(|c| c.ends_with("herdr-coordinator"))
         })
         .map(|(_, a)| staff_or_orphan(a))
         .collect();
@@ -358,7 +385,7 @@ fn load(app: &mut App) {
                 && !a
                     .cwd
                     .as_deref()
-                    .map_or(false, |c| c.ends_with("herdr-coordinator"))
+                    .is_some_and(|c| c.ends_with("herdr-coordinator"))
         })
         .map(|(_, a)| {
             let (l, s, _) = staff_or_orphan(a);
@@ -370,7 +397,7 @@ fn load(app: &mut App) {
     let len = app.projects.len();
     if len == 0 {
         app.selected.select(None);
-    } else if app.selected.selected().map_or(true, |s| s >= len) {
+    } else if app.selected.selected().is_none_or(|s| s >= len) {
         app.selected.select(Some(0));
     }
 }
@@ -392,16 +419,8 @@ fn section(title: &str) -> Block<'_> {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
-    let decisions: Vec<usize> = app
-        .projects
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.entry.status.as_deref() == Some("need_decision"))
-        .map(|(i, _)| i)
-        .collect();
-
     let unread = app.inbox.len().saturating_sub(app.cursor);
-    let inbox_h = (app.inbox.len().min(5).max(1) + 2) as u16;
+    let inbox_h = (app.inbox.len().clamp(1, 5) + 2) as u16;
     let orphan_h = if app.orphans.is_empty() {
         0
     } else {
@@ -412,10 +431,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         (app.tower_staff.len().min(4) + 2) as u16
     };
-    let dec_h = if decisions.is_empty() {
+    let dec_h = if app.decisions.is_empty() {
         0
     } else {
-        (decisions.len() + 2) as u16
+        (app.decisions.len().min(5) + 2) as u16
     };
 
     let rows = Layout::vertical([
@@ -435,7 +454,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     let (total, working, blocked) = app.totals;
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
     let mut header = vec![
-        Span::styled("TOWER", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "TOWER",
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("  {}", now), Style::default().fg(DIM)),
         Span::styled(format!("   {} agents", total), Style::default().fg(GRAY)),
         Span::raw("   "),
@@ -447,32 +469,44 @@ fn draw(f: &mut Frame, app: &mut App) {
     ];
     if let Some(t) = &app.synced_at {
         header.push(Span::styled(
-            format!("   synced {}", t),
+            format!("   event {}", t),
             Style::default().fg(DIM),
         ));
     }
     if let Some(e) = &app.error {
-        header.push(Span::styled(format!("   ⚠ {}", e), Style::default().fg(RED)));
+        header.push(Span::styled(
+            format!("   ⚠ {}", e),
+            Style::default().fg(RED),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(header)), rows[0]);
 
     // decisions
-    if !decisions.is_empty() {
-        let lines: Vec<Line> = decisions
+    if !app.decisions.is_empty() {
+        let lines: Vec<Line> = app
+            .decisions
             .iter()
-            .map(|&i| {
-                let p = &app.projects[i];
-                Line::from(vec![
+            .take(5)
+            .map(|decision| {
+                let mut spans = vec![
                     Span::styled(
-                        format!("{}  ", p.name),
+                        format!("{}  ", decision.project),
                         Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(p.entry.note.clone().unwrap_or_default(), Style::default().fg(FG)),
+                    Span::styled(decision.question.clone(), Style::default().fg(FG)),
                     Span::styled(
-                        format!("  {}", ago(p.entry.updated_at.as_deref().unwrap_or(""))),
+                        format!("  {}", ago(&decision.created_at)),
                         Style::default().fg(DIM),
                     ),
-                ])
+                    Span::styled(format!("  [{}]", decision.id), Style::default().fg(DIM)),
+                ];
+                if !decision.options.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  选项: {}", decision.options.join(" / ")),
+                        Style::default().fg(GRAY),
+                    ));
+                }
+                Line::from(spans)
             })
             .collect();
         let block = section("等你拍板").border_style(Style::default().fg(AMBER));
@@ -499,13 +533,19 @@ fn draw(f: &mut Frame, app: &mut App) {
             ];
             if let Some(note) = &p.entry.note {
                 if !note.is_empty() && st != "need_decision" {
-                    l1.push(Span::styled(format!("  — {}", note), Style::default().fg(DIM)));
+                    l1.push(Span::styled(
+                        format!("  — {}", note),
+                        Style::default().fg(DIM),
+                    ));
                 }
             }
             let mut lines = vec![Line::from(l1)];
             if p.commander_offline {
                 lines.push(Line::from(Span::styled(
-                    format!("    ⚠ 机长 {} 离线", p.entry.commander.as_deref().unwrap_or("?")),
+                    format!(
+                        "    ⚠ 机长 {} 离线",
+                        p.entry.commander.as_deref().unwrap_or("?")
+                    ),
                     Style::default().fg(RED),
                 )));
             }
@@ -525,10 +565,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                     lines.push(Line::from(vec![
                         Span::raw("    "),
                         dot(status_color(&m.status)),
-                        Span::styled(
-                            format!(" {}{}", m.role, role_pad),
-                            Style::default().fg(FG),
-                        ),
+                        Span::styled(format!(" {}{}", m.role, role_pad), Style::default().fg(FG)),
                         Span::styled(
                             format!("{:<8}", status_label(&m.status)),
                             Style::default().fg(GRAY),
@@ -625,7 +662,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         "收件箱".to_string()
     };
     let lines: Vec<Line> = if app.inbox.is_empty() {
-        vec![Line::from(Span::styled("（暂无汇报）", Style::default().fg(DIM)))]
+        vec![Line::from(Span::styled(
+            "（暂无汇报）",
+            Style::default().fg(DIM),
+        ))]
     } else {
         app.inbox
             .iter()
@@ -675,7 +715,12 @@ fn item_at(app: &App, y: u16) -> Option<usize> {
         return None;
     }
     let mut cur = inner_top;
-    for (i, h) in app.item_heights.iter().enumerate().skip(app.selected.offset()) {
+    for (i, h) in app
+        .item_heights
+        .iter()
+        .enumerate()
+        .skip(app.selected.offset())
+    {
         if y < cur + h {
             return Some(i);
         }
@@ -685,11 +730,17 @@ fn item_at(app: &App, y: u16) -> Option<usize> {
 }
 
 fn main() -> std::io::Result<()> {
+    let fleet = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("fleet");
+    let _ = Command::new(fleet).arg("watch-start").output();
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableMouseCapture)?;
     let (tx, rx) = mpsc::channel();
     let mut app = App {
         projects: Vec::new(),
+        decisions: Vec::new(),
         tower_staff: Vec::new(),
         orphans: Vec::new(),
         inbox: Vec::new(),
@@ -724,8 +775,7 @@ fn main() -> std::io::Result<()> {
                         if app.projects.iter().all(|p| app.expanded.contains(&p.name)) {
                             app.expanded.clear();
                         } else {
-                            app.expanded =
-                                app.projects.iter().map(|p| p.name.clone()).collect();
+                            app.expanded = app.projects.iter().map(|p| p.name.clone()).collect();
                         }
                     }
                     KeyCode::Char('r') => mark_read(&mut app),
@@ -759,7 +809,7 @@ fn main() -> std::io::Result<()> {
             last = Instant::now();
         }
         // 每 30 秒总结一轮成员进展；画面哈希没变的成员跳过调用
-        let worker_free = app.sum_worker.as_ref().map_or(true, |h| h.is_finished());
+        let worker_free = app.sum_worker.as_ref().is_none_or(|h| h.is_finished());
         if last_sum.elapsed() >= Duration::from_secs(30) && worker_free {
             let snapshot: Vec<(String, Option<String>)> = app
                 .projects
@@ -791,9 +841,7 @@ fn main() -> std::io::Result<()> {
                     }
                     let key = format!("proj:{}", p.name);
                     let h = hash_of(&input);
-                    if app.summaries.get(&key).map(|(ph, _)| ph.as_str())
-                        == Some(h.as_str())
-                    {
+                    if app.summaries.get(&key).map(|(ph, _)| ph.as_str()) == Some(h.as_str()) {
                         return None;
                     }
                     Some((key, h, input))
@@ -802,7 +850,9 @@ fn main() -> std::io::Result<()> {
             let tx = app.sum_tx.clone();
             app.sum_worker = Some(thread::spawn(move || {
                 for (name, prev) in snapshot {
-                    let Some(tail) = read_tail(&name) else { continue };
+                    let Some(tail) = read_tail(&name) else {
+                        continue;
+                    };
                     let h = hash_of(&tail);
                     if prev.as_deref() == Some(h.as_str()) {
                         continue;
@@ -870,9 +920,15 @@ fn save_dispatch(d: &DispatchState) {
 }
 
 fn dispatch_prompt(entries: &[InboxEntry]) -> String {
-    let mut s = format!("【塔台自动派单】收件箱有 {} 条新汇报待处理：\n", entries.len());
+    let mut s = format!(
+        "【塔台自动派单】收件箱有 {} 条新汇报待处理：\n",
+        entries.len()
+    );
     for e in entries {
-        s.push_str(&format!("- [{}] {} · {} · {}\n", e.ts, e.project, e.status, e.summary));
+        s.push_str(&format!(
+            "- [{}] {} · {} · {}\n",
+            e.ts, e.project, e.status, e.summary
+        ));
     }
     s.push_str(
         "请按塔台管制员标准流程处理：先运行 ./fleet inbox 确认消化这些消息，\
@@ -912,7 +968,7 @@ fn try_dispatch(app: &mut App) {
             .dispatch
             .cooldown_until
             .get(name)
-            .map_or(false, |&t| t > now)
+            .is_some_and(|&t| t > now)
         {
             return None;
         }
@@ -924,7 +980,7 @@ fn try_dispatch(app: &mut App) {
     let ok = Command::new("herdr")
         .args(["agent", "prompt", &target, &text])
         .output()
-        .map_or(false, |o| o.status.success());
+        .is_ok_and(|o| o.status.success());
     if ok {
         app.dispatch.cursor = app.inbox.len();
         app.dispatch.last_agent = Some(target.clone());
@@ -992,8 +1048,7 @@ fn hash_of(s: &str) -> String {
 
 fn llm_summarize(tail: &str, sys: &str) -> Option<String> {
     let key = std::env::var("DASHSCOPE_API_KEY").ok()?;
-    let model =
-        std::env::var("TOWER_SUMMARY_MODEL").unwrap_or_else(|_| "qwen3.7-flash".into());
+    let model = std::env::var("TOWER_SUMMARY_MODEL").unwrap_or_else(|_| "qwen3.7-flash".into());
     let body = serde_json::json!({
         "model": model,
         "messages": [
@@ -1025,5 +1080,9 @@ fn llm_summarize(tail: &str, sys: &str) -> Option<String> {
         .as_str()?
         .trim()
         .to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
