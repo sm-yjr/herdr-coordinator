@@ -14,6 +14,15 @@ from typing import Any
 def install(core: ModuleType) -> None:
     """Install timeout and governance guards on a loaded fleet core module."""
 
+    original_watch_start = core.cmd_watch_start
+    original_watch_status = core.cmd_watch_status
+
+    def plugin_mode() -> bool:
+        return bool(
+            core.os.environ.get("HERDR_PLUGIN_STATE_DIR")
+            or core.os.environ.get("HERDR_PLUGIN_ID")
+        )
+
     def snapshot_from_cli() -> dict[str, Any]:
         try:
             timeout = float(core.os.environ.get("HERDR_SNAPSHOT_TIMEOUT", "15"))
@@ -80,6 +89,24 @@ def install(core: ModuleType) -> None:
         core.refresh_attention()
         print(f"accepted: {claim['id']}")
 
+    def cmd_watch_start(args: list[str]) -> None:
+        if plugin_mode():
+            print("Plugin 模式由 Herdr startup/event hooks 维护实时状态，无独立 watcher")
+            return
+        original_watch_start(args)
+
+    def cmd_watch_status(args: list[str]) -> None:
+        if plugin_mode():
+            runtime = core.load_json(core.RUNTIME, {})
+            state = "已连接 Herdr" if runtime.get("connected") else "等待 snapshot 对账"
+            print(f"Plugin 事件模式（{state}，无独立 watcher）")
+            return
+        original_watch_status(args)
+
     core.snapshot_from_cli = snapshot_from_cli
     core.cmd_accept = cmd_accept
+    core.cmd_watch_start = cmd_watch_start
+    core.cmd_watch_status = cmd_watch_status
     core.COMMANDS["accept"] = cmd_accept
+    core.COMMANDS["watch-start"] = cmd_watch_start
+    core.COMMANDS["watch-status"] = cmd_watch_status
