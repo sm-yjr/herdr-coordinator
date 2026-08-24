@@ -48,6 +48,10 @@ def load_core() -> ModuleType:
 
 def main() -> None:
     resolve_state_environment()
+    # The compatibility watcher verifies its PID by matching fleet_core.py in the
+    # process command. Preserve that identity for the foreground watch command.
+    if len(sys.argv) > 1 and sys.argv[1] == "watch":
+        os.execv(sys.executable, [sys.executable, str(CORE_PATH), *sys.argv[1:]])
     core = load_core()
     from fleet_policy import install
 
