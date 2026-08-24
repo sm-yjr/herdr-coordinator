@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# Rust build artifacts
+tower/target/
+
+# Pi agent session data
+.pi/

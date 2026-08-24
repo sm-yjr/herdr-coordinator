@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""塔台注册表 + 收件箱 CLI。
+
+用法:
+  fleet init                                     初始化数据目录
+  fleet register <项目名> --tab <tab_id> --commander <agent名> --cwd <路径>
+  fleet set-status <项目名> <状态> [备注]         状态: working|idle|done|blocked|need_decision
+  fleet unregister <项目名>
+  fleet list                                     注册表 + herdr agent list 实时对账
+  fleet sync                                     从 herdr 实时状态自动同步注册表
+  fleet report <项目名> <状态> <一行摘要>          机长在关键节点调用，写入收件箱
+  fleet inbox [--all]                            读收件箱增量（默认只看未读，读完标记已读）
+"""
+import json, os, sys, subprocess, datetime
+
+HOME = os.path.expanduser("~/.herdr-coordinator")
+REG = os.path.join(HOME, "fleets.json")
+INBOX = os.path.join(HOME, "inbox.jsonl")
+CURSOR = os.path.join(HOME, "inbox.cursor")
+
+STATUSES = {"working", "idle", "done", "blocked", "need_decision"}
+
+
+def now():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_reg():
+    if not os.path.exists(REG):
+        return {}
+    with open(REG) as f:
+        return json.load(f)
+
+
+def save_reg(reg):
+    os.makedirs(HOME, exist_ok=True)
+    with open(REG, "w") as f:
+        json.dump(reg, f, ensure_ascii=False, indent=2)
+
+
+def cmd_init(_):
+    os.makedirs(HOME, exist_ok=True)
+    if not os.path.exists(REG):
+        save_reg({})
+    open(INBOX, "a").close()
+    if not os.path.exists(CURSOR):
+        with open(CURSOR, "w") as f:
+            f.write("0")
+    print(f"ok: {HOME}")
+
+
+def cmd_register(args):
+    name = args[0]
+    opts = dict(zip(args[1::2], args[2::2]))
+    reg = load_reg()
+    entry = reg.get(name, {})
+    entry.update({
+        "tab_id": opts.get("--tab", entry.get("tab_id")),
+        "commander": opts.get("--commander", entry.get("commander")),
+        "cwd": opts.get("--cwd", entry.get("cwd")),
+        "status": entry.get("status", "idle"),
+        "note": entry.get("note", ""),
+        "updated_at": now(),
+    })
+    reg[name] = entry
+    save_reg(reg)
+    print(f"registered: {name} -> {json.dumps(entry, ensure_ascii=False)}")
+
+
+def cmd_set_status(args):
+    name, status = args[0], args[1]
+    note = " ".join(args[2:])
+    if status not in STATUSES:
+        sys.exit(f"状态必须是: {'/'.join(sorted(STATUSES))}")
+    reg = load_reg()
+    if name not in reg:
+        sys.exit(f"未注册的项目: {name}（先 fleet register）")
+    reg[name]["status"] = status
+    if note:
+        reg[name]["note"] = note
+    reg[name]["updated_at"] = now()
+    save_reg(reg)
+    print(f"ok: {name} -> {status}")
+
+
+def cmd_unregister(args):
+    reg = load_reg()
+    if reg.pop(args[0], None) is None:
+        sys.exit(f"未注册的项目: {args[0]}")
+    save_reg(reg)
+    print(f"removed: {args[0]}")
+
+
+def cmd_list(_):
+    reg = load_reg()
+    r = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True)
+    live = {}
+    if r.returncode == 0:
+        try:
+            for a in json.loads(r.stdout)["result"]["agents"]:
+                live[a.get("name", "")] = a.get("agent_status", "unknown")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    if not reg:
+        print("(注册表为空)")
+        return
+    for name, e in reg.items():
+        cmd = e.get("commander", "?")
+        live_s = live.get(cmd, "offline")
+        print(f"{name:<16} 机长={cmd:<14} 注册状态={e.get('status','?'):<14} "
+              f"实时={live_s:<8} 更新={e.get('updated_at','?')}  {e.get('note','')}")
+    ghosts = {n for n in live if n.endswith("-cmd")} - {e.get("commander") for e in reg.values()}
+    if ghosts:
+        print(f"⚠ 存活但未注册的机长: {', '.join(sorted(ghosts))}")
+
+
+def cmd_report(args):
+    name, status = args[0], args[1]
+    summary = " ".join(args[2:])
+    if status not in STATUSES:
+        sys.exit(f"状态必须是: {'/'.join(sorted(STATUSES))}")
+    os.makedirs(HOME, exist_ok=True)
+    with open(INBOX, "a") as f:
+        f.write(json.dumps({"ts": now(), "project": name, "status": status,
+                            "summary": summary}, ensure_ascii=False) + "\n")
+    reg = load_reg()
+    if name in reg:
+        reg[name]["status"] = status
+        reg[name]["note"] = summary
+        reg[name]["updated_at"] = now()
+        save_reg(reg)
+    print("ok")
+
+
+def cmd_sync(_):
+    """从 herdr 实时状态同步注册表（自动更新 status 和 note）。"""
+    reg = load_reg()
+    if not reg:
+        print("(注册表为空)")
+        return
+    r = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True)
+    live = {}
+    if r.returncode == 0:
+        try:
+            for a in json.loads(r.stdout)["result"]["agents"]:
+                n = a.get("name", "")
+                if n:
+                    live[n] = a.get("agent_status", "unknown")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    changes = 0
+    for name, e in reg.items():
+        cmd = e.get("commander", "")
+        if not cmd:
+            continue
+        s = live.get(cmd, "offline")
+        old = e.get("status", "?")
+        # 映射：herdr 状态 → 注册表状态
+        if s == "blocked":
+            new_status = "blocked"
+        elif s in ("working", "idle", "done"):
+            # 保留 need_decision（需要机长主动 report 才能设）
+            if old == "need_decision":
+                new_status = old  # 不自动覆盖
+            else:
+                new_status = s
+        elif s == "offline":
+            new_status = "blocked" if old != "done" else "done"
+        else:
+            new_status = old
+        if new_status != old:
+            e["status"] = new_status
+            e["updated_at"] = now()
+            changes += 1
+            print(f"  {name}: {old} → {new_status}")
+    if changes:
+        save_reg(reg)
+        print(f"同步完成：{changes} 项变更")
+    else:
+        print("无变更")
+
+
+def cmd_inbox(args):
+    show_all = "--all" in args
+    if not os.path.exists(INBOX):
+        print("(收件箱为空)")
+        return
+    cursor = 0
+    if not show_all and os.path.exists(CURSOR):
+        cursor = int(open(CURSOR).read().strip() or 0)
+    with open(INBOX) as f:
+        lines = f.readlines()
+    new = lines if show_all else lines[cursor:]
+    if not new:
+        print("(没有新消息)")
+    for line in new:
+        e = json.loads(line)
+        print(f"[{e['ts']}] {e['project']} · {e['status']} · {e['summary']}")
+    if not show_all:
+        with open(CURSOR, "w") as f:
+            f.write(str(len(lines)))
+
+
+CMDS = {"init": cmd_init, "register": cmd_register, "set-status": cmd_set_status,
+        "unregister": cmd_unregister, "list": cmd_list, "report": cmd_report,
+        "inbox": cmd_inbox, "sync": cmd_sync}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
+        print(__doc__)
+        sys.exit(1)
+    try:
+        CMDS[sys.argv[1]](sys.argv[2:])
+    except IndexError:
+        print(__doc__)
+        sys.exit(1)
