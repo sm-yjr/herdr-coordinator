@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Resolve Herdr Coordinator state, then execute the fleet control plane."""
+"""Resolve shared state, install runtime guards, and dispatch fleet commands."""
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 import sys
+from types import ModuleType
 
 
 PLUGIN_ID = "sm-yjr.herdr-coordinator"
 ROOT = Path(__file__).resolve().parent
-CORE = ROOT / "fleet_core.py"
+CORE_PATH = ROOT / "fleet_core.py"
 
 
 def plugin_state_candidates() -> list[Path]:
@@ -35,9 +37,30 @@ def resolve_state_environment() -> None:
             return
 
 
+def load_core() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("herdr_coordinator_fleet_core", CORE_PATH)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"无法加载控制面实现: {CORE_PATH}")
+    core = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core)
+    return core
+
+
 def main() -> None:
     resolve_state_environment()
-    os.execv(sys.executable, [sys.executable, str(CORE), *sys.argv[1:]])
+    core = load_core()
+    from fleet_policy import install
+
+    install(core)
+    if len(sys.argv) < 2 or sys.argv[1] not in core.COMMANDS:
+        print(core.__doc__)
+        raise SystemExit(1)
+    try:
+        core.migrate_legacy_state()
+        core.COMMANDS[sys.argv[1]](sys.argv[2:])
+    except IndexError:
+        print(core.__doc__)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

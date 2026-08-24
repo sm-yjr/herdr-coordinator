@@ -53,7 +53,9 @@ Plugin 提供：
 
 导入只复制注册表、claims、decisions、inbox 等耐久数据，不复制旧的 `runtime.json`、watcher PID 或日志。`legacy-import.json` 记录来源和导入清单。
 
-Plugin startup 是一次性恢复，不运行常驻 daemon。事件 hook 可能并发执行，因此每个 hook 都在文件锁内重新读取一次权威 snapshot，而不是直接相信可能乱序到达的事件 payload。
+Plugin startup 是一次性恢复，不运行常驻 daemon。事件 hook 可能并发执行，因此每个 hook 都在文件锁内重新读取一次权威 snapshot，而不是直接相信可能乱序到达的事件 payload。snapshot 调用默认 15 秒超时，可用 `HERDR_SNAPSHOT_TIMEOUT` 调整。
+
+仓库根目录的 `./fleet` 是统一入口：plugin 进程直接使用 Herdr 注入的 state 目录；普通 commander/crew pane 没有 plugin 环境变量时，入口会自动发现已安装 plugin 的 state 目录。因此机长汇报、overlay、event hook 和命令行查看共享同一个状态源，不会形成一份 plugin 状态和一份 `~/.herdr-coordinator` 状态。内部实现位于 `fleet_core.py`，入口级超时与治理约束位于 `fleet_policy.py`；不要绕过根命令直接调用内部文件。
 
 ## 快速开始
 
@@ -196,7 +198,7 @@ fleet watch-start / watch-status / watch-stop
 
 ## 本地数据
 
-Plugin 模式优先使用 Herdr 注入的 `HERDR_PLUGIN_STATE_DIR`。独立模式使用 `HERDR_COORDINATOR_HOME`，默认回退到 `~/.herdr-coordinator/`。
+状态目录按以下优先级选择：Herdr 注入的 `HERDR_PLUGIN_STATE_DIR`、显式 `HERDR_COORDINATOR_HOME`、已安装 plugin 的 Herdr state 目录，最后才回退到 `~/.herdr-coordinator/`。所有角色都应调用根目录 `./fleet`，以确保共享同一个状态源。
 
 ```text
 fleets.json       项目注册表与当前 claim 指针
@@ -215,7 +217,7 @@ watch.pid/log     独立 watcher 的兼容状态
 ## 开发与验证
 
 ```bash
-python3 -m py_compile fleet scripts/plugin_runtime.py tower/plugin_tower.py
+python3 -m py_compile fleet fleet_core.py fleet_policy.py scripts/plugin_runtime.py tower/plugin_tower.py
 python3 -m unittest discover -s tests -v
 bash -n scripts/open-tower.sh
 bash -n dashboard.sh

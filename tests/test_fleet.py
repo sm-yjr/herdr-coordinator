@@ -132,6 +132,25 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(decision["question"], "旧版遗留问题")
         self.assertEqual(decision["source"], "legacy_registry_migration")
 
+    def test_wrapper_discovers_installed_plugin_state(self):
+        xdg_state = self.root / "xdg-state"
+        plugin_state = xdg_state / "herdr" / "plugins" / "sm-yjr.herdr-coordinator"
+        plugin_state.mkdir(parents=True)
+        env = os.environ.copy()
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        env.pop("HERDR_COORDINATOR_HOME", None)
+        env.pop("HERDR_PLUGIN_ID", None)
+        env["XDG_STATE_HOME"] = str(xdg_state)
+        result = subprocess.run(
+            [str(FLEET), "init"],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertIn(str(plugin_state), result.stdout)
+        self.assertTrue((plugin_state / "fleets.json").exists())
+
     def test_plugin_state_dir_takes_precedence(self):
         plugin_state = self.root / "plugin-state"
         env = self.env.copy()
@@ -163,6 +182,23 @@ class FleetTest(unittest.TestCase):
         self.assertNotIn("runtime.json", marker["imported"])
         runtime = json.loads((plugin_state / "runtime.json").read_text())
         self.assertTrue(runtime["connected"])
+
+    def test_plugin_snapshot_has_bounded_timeout(self):
+        fake_bin = self.root / "timeout-bin"
+        fake_bin.mkdir()
+        fake_herdr = fake_bin / "herdr"
+        fake_herdr.write_text(
+            "#!/usr/bin/env python3\n"
+            "import time\n"
+            "time.sleep(1)\n"
+        )
+        fake_herdr.chmod(0o755)
+        env = self.env.copy()
+        env["HERDR_BIN_PATH"] = str(fake_herdr)
+        env["HERDR_SNAPSHOT_TIMEOUT"] = "0.02"
+        result = self.fleet("plugin-reconcile", check=False, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("snapshot 超时", result.stderr)
 
     def test_plugin_reconcile_uses_snapshot_and_preserves_project_state(self):
         snapshot = {
@@ -287,13 +323,41 @@ class FleetTest(unittest.TestCase):
             [item["kind"] for item in self.load("attention.json")],
         )
 
-    def test_accept_requires_verification_unless_forced(self):
+    def test_accept_requires_verification_unless_forced_with_note(self):
         report = self.fleet("report", "demo", "done", "声称完成")
         claim_id = report.stdout.splitlines()[0].split(": ", 1)[1]
         denied = self.fleet("accept", "demo", "--claim", claim_id, check=False)
         self.assertNotEqual(denied.returncode, 0)
-        self.fleet("accept", "demo", "--claim", claim_id, "--force")
+        missing_note = self.fleet(
+            "accept", "demo", "--claim", claim_id, "--force", check=False
+        )
+        self.assertNotEqual(missing_note.returncode, 0)
+        self.fleet(
+            "accept",
+            "demo",
+            "--claim",
+            claim_id,
+            "--force",
+            "--note",
+            "用户接受未验证风险",
+        )
         self.assertEqual(self.load("claims.json")[0]["state"], "accepted")
+
+    def test_force_cannot_accept_non_done_claim(self):
+        report = self.fleet("report", "demo", "working", "仍在开发")
+        claim_id = report.stdout.splitlines()[0].split(": ", 1)[1]
+        result = self.fleet(
+            "accept",
+            "demo",
+            "--claim",
+            claim_id,
+            "--force",
+            "--note",
+            "不应允许",
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.load("claims.json")[0]["state"], "reported")
 
     def test_attention_prioritizes_decision_then_stale_block(self):
         self.fleet(

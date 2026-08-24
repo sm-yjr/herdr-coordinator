@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Python syntax
-        run: python3 -m py_compile fleet scripts/plugin_runtime.py tower/plugin_tower.py
+        run: python3 -m py_compile fleet fleet_core.py fleet_policy.py scripts/plugin_runtime.py tower/plugin_tower.py
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
       - name: Shell syntax
