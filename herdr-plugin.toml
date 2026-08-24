@@ -6,7 +6,7 @@ description = "Human-in-the-loop supervisory control plane for long-running codi
 platforms = ["linux", "macos"]
 
 [[startup]]
-command = ["python3", "fleet", "plugin-reconcile"]
+command = ["python3", "scripts/plugin_runtime.py", "reconcile"]
 
 [[actions]]
 id = "open"
@@ -20,50 +20,50 @@ id = "reconcile"
 title = "Reconcile Fleet Runtime"
 description = "Refresh the coordinator runtime projection from a Herdr snapshot."
 contexts = ["workspace", "pane"]
-command = ["python3", "fleet", "plugin-reconcile"]
+command = ["python3", "scripts/plugin_runtime.py", "reconcile"]
 
 [[panes]]
 id = "tower"
 title = "Fleet Control Tower"
 placement = "overlay"
-command = ["python3", "tower/plugin_tower.py"]
+command = ["python3", "scripts/plugin_runtime.py", "tower"]
 
 [[events]]
 on = "workspace.created"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "workspace.closed"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "tab.created"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "tab.closed"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "pane.created"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "pane.closed"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "pane.moved"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "pane.exited"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "pane.agent_detected"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["python3", "fleet", "plugin-event"]
+command = ["python3", "scripts/plugin_runtime.py", "event"]
