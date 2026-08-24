@@ -1,214 +1,243 @@
 # Herdr Coordinator（塔台）
 
-Herdr Coordinator 是一个面向多项目 Agent 协作的轻量塔台。它不接管项目内部的任务拆分和代码实现，只维护三个事实：有哪些项目、每个项目的机长是谁、项目当前处于什么状态。
+Herdr Coordinator 是一个面向长时间运行、跨项目 coding-agent fleet 的人机协作控制面。它不替代 Claude Code、Codex、Pi 等执行 Agent，也不接管项目内部的任务拆分；它只维护项目、机长、可信状态、用户决策和需要人类介入的事项。
 
-项目通过 Herdr socket API 订阅 Agent 状态事件，并通过 `herdr` CLI 向机长转发指令；注册表、决策和汇报收件箱持久化在本地文件中，因此塔台重启或上下文压缩后仍能恢复现场。
-
-> 当前版本面向 macOS 和本地单用户 Herdr 会话。注册表是本地状态，不是 GitHub、数据库或多机同步服务。
+核心目标不是“多开几个 Agent”，而是降低一个操作者监督多个项目时的注意力成本：哪一个项目最需要介入、为什么、应该由谁采取什么动作。
 
 ## 核心模型
 
-每个项目对应一个独立 fleet：
+每个项目对应一个 fleet：
 
-- **机长（commander）**：项目唯一决策者，负责拆任务、分派、验收和汇报。
+- **机长（commander）**：项目唯一负责人，持有项目上下文、拆任务、派乘务、验收并向塔台汇报。
 - **副机长（reviewer）**：可选的建议性审查者。
-- **乘务（crew）**：执行具体任务的 Agent。
-- **塔台（coordinator）**：只登记项目、转发指令和汇总状态，不保存项目实现细节。
+- **乘务（crew）**：执行具体任务。
+- **塔台（coordinator）**：登记项目、观察运行时、记录声明与证据、路由指令、汇总需要人类介入的事项。
 
-项目状态以机长汇报为准；Agent 是否在线、正在工作或等待输入则来自 Herdr 事件。两者分开保存，Agent 从 `working` 变成 `idle` 不会擅自改变项目的业务状态。机长在完成、卡住或需要用户决策时主动写入收件箱，塔台无需轮询每个 Agent。
+塔台将四类事实分开保存：
 
 ```text
-Herdr socket 事件 ──> runtime.json ──> 实时状态与离线提示
-机长 fleet report ──> fleets.json  ──> 项目业务状态
-机长 fleet ask    ──> decisions.json ─> 待拍板事项与解决记录
+Herdr snapshot / event ──> runtime.json   observed：Agent 在线、working/blocked/idle
+commander fleet report ──> claims.json    claimed：机长声称项目处于什么状态
+fleet verify command   ──> claims.json    verified：塔台进程实际执行命令得到的证据
+fleet ask / accept     ──> decisions.json governed：用户决策与最终验收
 ```
 
-塔台只连接这三条控制面数据流。任务拆分、worktree、测试、合并和发布仍由项目机长负责。
+实时 `blocked` 不等于正式 `need_decision`；机长声称 `done` 也不等于已经通过验证或用户验收。
 
-## 组成
+## 作为 Herdr plugin 安装
 
-| 路径 | 作用 |
-| --- | --- |
-| `AGENTS.md` | 塔台的操作约定、fleet 编制和故障处置规则 |
-| `fleet` | 注册表与收件箱命令行工具 |
-| `dashboard.sh` | 只读刷新式终端看板 |
-| `tower/` | 基于 Ratatui 的交互式终端看板 |
-
-## 环境要求
-
-- 已安装并启动 Herdr，`herdr` 命令位于 `PATH`
-- 命令在 Herdr 管理的 pane 内运行，环境变量 `HERDR_ENV=1`
-- Python 3.9 或更高版本，用于 `fleet`
-- Bash，用于 `dashboard.sh`
-- Rust stable 和 Cargo，仅在构建 `tower` 时需要
-- `curl`，仅在启用可选的 Agent 进展摘要时需要
-
-可先检查运行环境：
+要求：Herdr 0.8.2 或更高版本、Python 3.9+，主机为 macOS 或 Linux。
 
 ```bash
-test "${HERDR_ENV:-}" = 1
-herdr agent list
-python3 --version
+herdr plugin install sm-yjr/herdr-coordinator
+herdr plugin action invoke open --plugin sm-yjr.herdr-coordinator
 ```
 
-## 快速开始
+本地开发时：
 
 ```bash
 git clone https://github.com/sm-yjr/herdr-coordinator.git
 cd herdr-coordinator
-
-# 初始化本地注册表和收件箱
-./fleet init
-
-# 启动 Herdr 事件监听器
-./fleet watch-start
-./fleet watch-status
-
-# 查看登记状态并与 Herdr 实时状态对账
-./fleet list
-
-# 读取尚未处理的机长汇报
-./fleet inbox
+herdr plugin link "$(pwd)"
+herdr plugin action invoke open --plugin sm-yjr.herdr-coordinator
 ```
 
-登记一个已经在 Herdr 中启动的项目 fleet：
+Plugin 提供：
+
+- Herdr 启动后的 snapshot 对账；
+- pane / tab / workspace / Agent 状态事件触发的增量重对账；
+- `Fleet Control Tower` overlay；
+- `open` 与 `reconcile` 两个 action；
+- Herdr 管理的独立 config/state 目录；
+- 首次启动时从独立模式的 `~/.herdr-coordinator/` 一次性导入耐久状态。
+
+导入只复制注册表、claims、decisions、inbox 等耐久数据，不复制旧的 `runtime.json`、watcher PID 或日志。`legacy-import.json` 记录来源和导入清单。
+
+Plugin startup 是一次性恢复，不运行常驻 daemon。事件 hook 可能并发执行，因此每个 hook 都在文件锁内重新读取一次权威 snapshot，而不是直接相信可能乱序到达的事件 payload。snapshot 调用默认 15 秒超时，可用 `HERDR_SNAPSHOT_TIMEOUT` 调整。
+
+仓库根目录的 `./fleet` 是统一入口：plugin 进程直接使用 Herdr 注入的 state 目录；普通 commander/crew pane 没有 plugin 环境变量时，入口会自动发现已安装 plugin 的 state 目录。因此机长汇报、overlay、event hook 和命令行查看共享同一个状态源，不会形成一份 plugin 状态和一份 `~/.herdr-coordinator` 状态。内部实现位于 `fleet_core.py`，入口级超时与治理约束位于 `fleet_policy.py`；不要绕过根命令直接调用内部文件。
+
+## 快速开始
 
 ```bash
+./fleet init
+
 ./fleet register demo \
   --tab w1:t2 \
   --commander demo-cmd \
   --cwd /path/to/demo
 
-./fleet set-status demo working "正在实现首个版本"
 ./fleet list
+./fleet attention
 ```
 
-机长在关键节点写入汇报：
+在未安装为 plugin 的兼容模式中，可以运行长连接 watcher：
 
 ```bash
-./fleet report demo working "正在实现配置迁移"
-./fleet report demo blocked "外部测试环境暂时不可用"
-./fleet report demo done "实现和测试均已完成"
+./fleet watch-start
+./fleet watch-status
 ```
 
-需要用户拍板时，应创建正式决策，而不是把实时 `blocked` 直接解释为问题：
+Plugin 模式不需要 `watch-start`。
+
+## 项目汇报与可信完成
+
+机长汇报业务状态：
+
+```bash
+./fleet report demo working "正在实现配置迁移" --confidence 0.8
+
+./fleet report demo done "迁移逻辑和单元测试已完成" \
+  --confidence 0.92 \
+  --evidence "commit:7596450" \
+  --evidence "pr:42"
+```
+
+`--evidence` 是机长提供的线索，默认只是未验证声明。机器验证必须由塔台显式执行：
+
+```bash
+./fleet verify demo \
+  --label unit-tests \
+  -- python3 -m unittest discover -s tests -v
+```
+
+验证命令的退出码、耗时以及 stdout/stderr 尾部会写入本地 `claims.json`。不要让验证命令把密钥或敏感日志输出到终端。
+
+也可以指定某个 claim：
+
+```bash
+./fleet claims demo --all
+./fleet verify demo --claim <claim-id> --label cargo-check -- \
+  cargo check --manifest-path tower/Cargo.toml
+```
+
+验证通过后，claim 从 `reported` 变为 `verified`。用户验收：
+
+```bash
+./fleet accept demo --claim <claim-id> --note "验收通过"
+```
+
+默认只有 `done + verified` 的 claim 可以验收。确需人工覆盖时使用 `--force`，并用 `--note` 明确记录接受风险的原因：
+
+```bash
+./fleet accept demo --claim <claim-id> --force --note "接受已知风险"
+```
+
+## 用户决策
+
+机长遇到真正需要用户拍板的问题时：
 
 ```bash
 ./fleet ask demo "是否保留旧配置格式？" \
   --option "保留，兼容旧版本" \
   --option "升级，只支持新格式"
-
-./fleet decisions
-./fleet resolve <决策编号> "保留旧格式"
 ```
 
-为兼容已有机长 prompt，下面的旧写法也会自动创建正式决策：
+塔台查看和解决：
+
+```bash
+./fleet decisions
+./fleet resolve <decision-id> "保留旧格式"
+```
+
+兼容旧写法：
 
 ```bash
 ./fleet report demo need_decision "是否保留旧配置格式？"
 ```
 
-项目结束并关闭对应 Herdr tab 后，从注册表移除：
+## 注意力队列
+
+`fleet attention` 不展示所有变化，而是按“此刻人类介入能释放多少后续工作”排序：
 
 ```bash
-./fleet unregister demo
+./fleet attention
+./fleet attention --json
 ```
 
-塔台向项目发送具体指令时使用唯一机长路由：
+当前识别：
+
+| 类型 | 含义 | 默认负责人 |
+| --- | --- | --- |
+| `decision_required` | 存在未解决的正式决策 | user |
+| `runtime_disconnected` | 无法获得 Herdr 权威运行时状态 | coordinator |
+| `stale_blocked` | 机长阻塞超过 10 分钟且未创建决策 | coordinator |
+| `observed_blocked` | 机长实时 blocked，但尚无正式决策 | coordinator |
+| `commander_offline` | 项目仍 working/blocked，但机长离线 | coordinator |
+| `reported_done_unverified` | 机长声称完成，但没有通过的机器证据 | coordinator |
+| `ready_for_acceptance` | 已验证，等待用户最终验收 | user |
+| `project_idle_mismatch` | 项目仍 working，但机长长期 idle | coordinator |
+
+每条 intervention 都包含确定性的类型、优先级、原因、负责人和建议命令。投影同时写入 `attention.json`，供 overlay 和其他工具读取。
+
+## 指令路由
+
+塔台只把完整目标发给注册表中的唯一机长：
 
 ```bash
-./fleet route demo "检查失败的 CI，并给出修复后的验证结果"
+./fleet route demo "检查失败的 CI，修复后给出验证证据"
 ```
 
-`route` 的目标只能是注册表中的机长，调用者不能指定副机长或乘务。机长收到完整目标后自行拆分和验收。
+调用方不能指定副机长或乘务。任务拆分、worktree、测试策略、合并和发布仍由机长负责。
 
-## 状态与收件箱
+## 常用命令
 
-注册表支持以下状态：
-
-| 状态 | 含义 |
-| --- | --- |
-| `working` | 项目正在执行任务 |
-| `idle` | 机长空闲，可以接收指令 |
-| `done` | 当前目标已经完成 |
-| `blocked` | 项目无法继续，需要排查阻塞原因 |
-| `need_decision` | 存在一条或多条尚未解决的正式决策 |
-
-`./fleet sync` 是断线诊断和手工恢复命令：它读取一次 Herdr 快照并重建 `runtime.json`，不会修改项目注册表。正常运行时由 `./fleet watch` 使用“首次快照 + 长连接订阅 + 断线重连”维护实时缓存。
-
-`blocked` 只是 Herdr 观察到 Agent 等待输入。它可能是提问、审批界面或工具自身故障，因此不会自动产生 `need_decision`。只有机长明确执行 `fleet ask` 或汇报 `need_decision` 才会创建决策。
-
-`./fleet inbox` 默认只显示未读消息，并在读取后推进游标。使用 `./fleet inbox --all` 可以查看完整历史。
-
-## 终端看板
-
-不构建 Rust 程序时，可使用刷新式看板：
-
-```bash
-./dashboard.sh       # 默认每 3 秒刷新
-./dashboard.sh 5     # 每 5 秒刷新
+```text
+fleet init
+fleet register / unregister
+fleet list
+fleet route
+fleet report / claims / verify / accept
+fleet ask / decisions / resolve
+fleet attention
+fleet inbox
+fleet sync
+fleet plugin-reconcile / plugin-event
+fleet watch-start / watch-status / watch-stop
 ```
-
-两个看板都会确保事件监听器已经启动。看板的刷新周期只负责重绘本地缓存，不会周期性查询 Herdr。
-
-交互式 Ratatui 看板的运行方式：
-
-```bash
-cargo run --release --manifest-path tower/Cargo.toml
-```
-
-常用操作：
-
-- `j` / `k` 或方向键：切换项目
-- 鼠标点击：展开或折叠项目
-- `Enter`：全部展开或全部折叠
-- `r` 或点击收件箱：标记汇报为已读
-- `d`：切换收件箱自动派单
-- `q` 或 `Esc`：退出
-
-看板每 5 秒刷新一次 Herdr 和注册表状态。自动派单只会把新汇报发给空闲的塔台管制员；没有可用管制员时，消息保留在队列中等待下一轮。
-
-## 可选的进展摘要
-
-交互式看板可以读取 Agent 终端尾部内容，并通过 DashScope 兼容接口生成一句中文进展摘要。此功能未配置密钥时自动跳过，不影响其他功能。
-
-```bash
-export DASHSCOPE_API_KEY="your-api-key"
-export TOWER_SUMMARY_MODEL="qwen3.7-flash"  # 可选
-cargo run --release --manifest-path tower/Cargo.toml
-```
-
-API Key 只从环境变量读取，不会写入项目文件。启用后，Agent 终端的部分文本会发送给所配置的模型服务；涉及敏感代码或日志时应关闭此功能。
 
 ## 本地数据
 
-运行时数据写入 `~/.herdr-coordinator/`：
+状态目录按以下优先级选择：Herdr 注入的 `HERDR_PLUGIN_STATE_DIR`、显式 `HERDR_COORDINATOR_HOME`、已安装 plugin 的 Herdr state 目录，最后才回退到 `~/.herdr-coordinator/`。所有角色都应调用根目录 `./fleet`，以确保共享同一个状态源。
 
 ```text
-fleets.json       项目注册表
-inbox.jsonl       机长汇报历史
+fleets.json       项目注册表与当前 claim 指针
+claims.json       状态声明、机器证据、验收记录
+decisions.json    待拍板事项与解决记录
+runtime.json      Herdr snapshot/event 的实时投影
+attention.json    排序后的人工介入队列
+legacy-import.json 独立模式状态的一次性导入记录
+inbox.jsonl       状态、验证、决策和验收事件历史
 inbox.cursor      收件箱已读位置
-decisions.json    待拍板事项及解决记录
-runtime.json      由 Herdr 事件生成的实时缓存
-watch.pid         事件监听器进程记录
-watch.log         事件监听器诊断日志
-dispatch.json     自动派单位置与最近目标
-summaries.json    进展摘要缓存
+watch.pid/log     独立 watcher 的兼容状态
 ```
 
-这些文件不属于 Git 仓库。备份或迁移时，应把整个目录视为一个一致的数据集。手工编辑前先退出看板，避免与运行中的写入发生冲突。
+写入使用进程锁、临时文件、`fsync` 和原子替换。当前实现适合一个本地操作者管理一个 Herdr 会话，不提供多用户认证或网络服务。
 
 ## 开发与验证
 
 ```bash
-python3 -m py_compile fleet
+python3 -m py_compile fleet fleet_core.py fleet_policy.py scripts/plugin_runtime.py tower/plugin_tower.py
 python3 -m unittest discover -s tests -v
+bash -n scripts/open-tower.sh
 bash -n dashboard.sh
 cargo check --manifest-path tower/Cargo.toml
 ```
 
-事件监听器只连接本机 Unix socket，并在断线后重新获取完整快照。项目目前没有远程认证或多机并发写入保护，适合由一个操作者管理一个本地 Herdr 会话；不适合作为共享控制面直接暴露到网络。
+CI 在 Linux 和 macOS 上执行 Python、Shell 和 Rust 检查。
+
+## 设计边界
+
+Herdr Coordinator 是监督控制面，不是任务 orchestrator。以下信息不进入塔台注册表：
+
+- 乘务级 task DAG；
+- worktree 和分支分配；
+- 测试与构建流水线定义；
+- merge queue 和发布步骤；
+- 项目实现细节。
+
+这些属于机长的执行层。塔台只保存跨上下文恢复所需的最小控制面事实。
 
 ## License
 
-本项目采用 [MIT License](LICENSE)。
+MIT

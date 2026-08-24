@@ -1,0 +1,69 @@
+id = "sm-yjr.herdr-coordinator"
+name = "Herdr Coordinator"
+version = "0.2.0"
+min_herdr_version = "0.8.2"
+description = "Human-in-the-loop supervisory control plane for long-running coding-agent fleets."
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["python3", "scripts/plugin_runtime.py", "reconcile"]
+
+[[actions]]
+id = "open"
+title = "Open Fleet Control Tower"
+description = "Open, focus, or close the Herdr Coordinator overlay."
+contexts = ["workspace", "pane"]
+command = ["bash", "scripts/open-tower.sh"]
+
+[[actions]]
+id = "reconcile"
+title = "Reconcile Fleet Runtime"
+description = "Refresh the coordinator runtime projection from a Herdr snapshot."
+contexts = ["workspace", "pane"]
+command = ["python3", "scripts/plugin_runtime.py", "reconcile"]
+
+[[panes]]
+id = "tower"
+title = "Fleet Control Tower"
+placement = "overlay"
+command = ["python3", "scripts/plugin_runtime.py", "tower"]
+
+[[events]]
+on = "workspace.created"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "workspace.closed"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "tab.created"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "tab.closed"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "pane.created"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "pane.moved"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "pane.exited"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "scripts/plugin_runtime.py", "event"]
