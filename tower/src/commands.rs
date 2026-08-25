@@ -35,6 +35,13 @@ pub const USAGE: &str = r#"Herdr Coordinator 的注册表、可信状态协议�
   fleet resolve <决策编号> <答案>
   fleet attention [--json]
   fleet inbox [--all]
+  fleet controller-register [<Agent 名或 pane id>] [--role auto|primary|research|verification|standby]
+  fleet controller-unregister <管制员 id、Agent 名或 pane id>
+  fleet controllers
+  fleet deliveries [--all]
+  fleet delivery-ack <投递 id>
+  fleet delivery-release <投递 id>
+  fleet dispatch
   fleet plugin-reconcile | plugin-event
   fleet watch | watch-start | watch-status | watch-stop
   fleet tower | open
@@ -51,8 +58,9 @@ pub fn run(state: &State, args: &[String]) -> Result<i32> {
         return Ok(0);
     }
     state.migrate_legacy()?;
+    state.init()?;
     let rest = &args[1..];
-    match command {
+    let result = match command {
         "init" => cmd_init(state, rest),
         "register" => cmd_register(state, rest),
         "set-status" => cmd_set_status(state, rest),
@@ -69,6 +77,13 @@ pub fn run(state: &State, args: &[String]) -> Result<i32> {
         "resolve" => cmd_resolve(state, rest),
         "attention" => cmd_attention(state, rest),
         "inbox" => cmd_inbox(state, rest),
+        "controller-register" => cmd_controller_register(state, rest),
+        "controller-unregister" => cmd_controller_unregister(state, rest),
+        "controllers" => cmd_controllers(state, rest),
+        "deliveries" => cmd_deliveries(state, rest),
+        "delivery-ack" => cmd_delivery_ack(state, rest),
+        "delivery-release" => cmd_delivery_release(state, rest),
+        "dispatch" => cmd_dispatch(state, rest),
         "plugin-reconcile" => cmd_plugin_reconcile(state, rest),
         "plugin-event" => cmd_plugin_event(state, rest),
         "watch" | "watch-start" | "watch-status" | "watch-stop" => {
@@ -77,7 +92,30 @@ pub fn run(state: &State, args: &[String]) -> Result<i32> {
         "tower" => crate::ui::run(state).map(|_| 0),
         "open" => cmd_open(rest),
         _ => bail!(USAGE),
+    };
+    if result.is_ok()
+        && matches!(
+            command,
+            "register"
+                | "set-status"
+                | "unregister"
+                | "sync"
+                | "report"
+                | "verify"
+                | "accept"
+                | "ask"
+                | "resolve"
+                | "controller-register"
+                | "delivery-release"
+                | "plugin-reconcile"
+                | "plugin-event"
+        )
+    {
+        if let Err(error) = crate::dispatch::dispatch_one(state) {
+            eprintln!("警告：状态已保存，但塔台事件暂未送达：{error}");
+        }
     }
+    result
 }
 
 fn no_args(args: &[String]) -> Result<()> {
@@ -1038,6 +1076,308 @@ fn cmd_inbox(state: &State, args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+const CONTROLLER_ROLES: &[&str] = &["auto", "primary", "research", "verification", "standby"];
+
+fn agent_session_id(agent: &Value) -> Option<String> {
+    agent
+        .get("agent_session")
+        .and_then(|value| value.get("value"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn controller_role_label(role: &str) -> &'static str {
+    match role {
+        "primary" => "主管制员",
+        "research" => "上下文调查员",
+        "verification" => "验证管制员",
+        "standby" => "备用管制员",
+        _ => "管制员",
+    }
+}
+
+fn automatic_controller_role(controllers: &[Value]) -> &'static str {
+    for role in ["primary", "research", "verification"] {
+        if !controllers.iter().any(|item| string(item, "role") == role) {
+            return role;
+        }
+    }
+    "standby"
+}
+
+fn current_pane_target() -> Result<String> {
+    let mut command = Command::new(herdr_bin());
+    command.args(["pane", "current", "--current"]);
+    let output = output_with_timeout(command, snapshot_timeout()?, "herdr pane current --current")?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim())
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).context("无法解析当前 pane")?;
+    value
+        .get("result")
+        .unwrap_or(&value)
+        .get("pane")
+        .and_then(|pane| pane.get("pane_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("Herdr 未返回当前 pane id"))
+}
+
+fn cmd_controller_register(state: &State, args: &[String]) -> Result<i32> {
+    let mut target: Option<String> = None;
+    let mut role = "auto".to_string();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--current" => {
+                index += 1;
+            }
+            "--role" if index + 1 < args.len() => {
+                role = args[index + 1].clone();
+                index += 2;
+            }
+            value if !value.starts_with("--") && target.is_none() => {
+                target = Some(value.to_string());
+                index += 1;
+            }
+            _ => bail!(USAGE),
+        }
+    }
+    if !CONTROLLER_ROLES.contains(&role.as_str()) {
+        bail!("管制员角色必须是: {}", CONTROLLER_ROLES.join("/"))
+    }
+    let target = if let Some(target) = target {
+        target
+    } else {
+        current_pane_target().or_else(|_| {
+            env::var("HERDR_PANE_ID")
+                .context("无法确定当前 pane；请提供 Agent 名、pane id 或 --current")
+        })?
+    };
+
+    let mut runtime = state.load("runtime.json", json!({}));
+    let find_agent = |runtime: &Value| {
+        runtime
+            .get("agents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|agent| {
+                agent.get("name").and_then(Value::as_str) == Some(target.as_str())
+                    || agent.get("pane_id").and_then(Value::as_str) == Some(target.as_str())
+            })
+            .cloned()
+    };
+    let agent = if let Some(agent) = find_agent(&runtime) {
+        agent
+    } else {
+        let snapshot = snapshot_from_cli()?;
+        runtime = state.write_runtime(&snapshot, true, None, "controller_register", None)?;
+        find_agent(&runtime).ok_or_else(|| anyhow!("Herdr 中不存在 Agent: {target}"))?
+    };
+    let session_id = agent_session_id(&agent);
+    let pane_id = string(&agent, "pane_id");
+    let agent_name = optional_string(&agent, "name");
+    let tab_id = optional_string(&agent, "tab_id");
+    if state.registry().values().any(|entry| {
+        let commander = string(entry, "commander");
+        commander == target || agent_name.as_deref() == Some(commander.as_str())
+    }) {
+        bail!("项目机长不能同时登记为塔台管制员；塔台与执行层必须分离")
+    }
+
+    let (id, assigned_role) = state.with_lock(|| {
+        let mut controllers = state.controllers();
+        let existing = controllers.iter().position(|item| {
+            (!target.is_empty() && string(item, "target") == target)
+                || session_id
+                    .as_deref()
+                    .zip(item.get("agent_session_id").and_then(Value::as_str))
+                    .is_some_and(|(left, right)| left == right)
+        });
+        if existing.is_none() && controllers.len() >= 3 {
+            bail!("塔台最多登记 3 个管制员；请先移除不用的席位")
+        }
+        let assigned_role = if role == "auto" {
+            existing
+                .and_then(|position| controllers[position].get("role"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| automatic_controller_role(&controllers).to_string())
+        } else {
+            role.clone()
+        };
+        if assigned_role != "standby"
+            && controllers.iter().enumerate().any(|(position, item)| {
+                Some(position) != existing && string(item, "role") == assigned_role
+            })
+        {
+            bail!("角色 {assigned_role} 已有管制员；使用 standby 或先移除原席位")
+        }
+        let id = existing
+            .map(|position| string(&controllers[position], "id"))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("controller-{}", short_uuid(8)));
+        let registered_at = existing
+            .and_then(|position| optional_string(&controllers[position], "registered_at"))
+            .unwrap_or_else(now);
+        let last_assigned = existing
+            .and_then(|position| controllers[position].get("last_assigned_at_ms").cloned())
+            .unwrap_or_else(|| json!(0));
+        let value = json!({
+            "id": id,
+            "target": agent_name.clone().unwrap_or_else(|| pane_id.clone()),
+            "agent_name": agent_name,
+            "pane_id": pane_id,
+            "tab_id": tab_id,
+            "agent_session_id": session_id,
+            "role": assigned_role,
+            "enabled": true,
+            "registered_at": registered_at,
+            "updated_at": now(),
+            "last_assigned_at_ms": last_assigned
+        });
+        if let Some(position) = existing {
+            controllers[position] = value;
+        } else {
+            controllers.push(value);
+        }
+        state.write_json("controllers.json", &Value::Array(controllers))?;
+        Ok((id, assigned_role))
+    })?;
+    println!(
+        "registered: {id}（{}；事件会在该 Agent 空闲时自动送达）",
+        controller_role_label(&assigned_role)
+    );
+    Ok(0)
+}
+
+fn cmd_controller_unregister(state: &State, args: &[String]) -> Result<i32> {
+    if args.len() != 1 {
+        bail!(USAGE)
+    }
+    let target = &args[0];
+    state.with_lock(|| {
+        let mut controllers = state.controllers();
+        let before = controllers.len();
+        controllers.retain(|item| {
+            string(item, "id") != *target
+                && string(item, "target") != *target
+                && string(item, "pane_id") != *target
+        });
+        if controllers.len() == before {
+            bail!("未知管制员: {target}")
+        }
+        let removed: HashSet<String> = state
+            .controllers()
+            .iter()
+            .map(|item| string(item, "id"))
+            .filter(|id| !controllers.iter().any(|item| string(item, "id") == *id))
+            .collect();
+        let mut deliveries = state.deliveries();
+        for delivery in &mut deliveries {
+            if string(delivery, "state") == "leased"
+                && removed.contains(&string(delivery, "assigned_controller"))
+            {
+                delivery["state"] = json!("pending");
+                delivery["assigned_controller"] = Value::Null;
+                delivery["lease_expires_at_ms"] = Value::Null;
+            }
+        }
+        state.write_json("controllers.json", &Value::Array(controllers))?;
+        state.write_json("deliveries.json", &Value::Array(deliveries))
+    })?;
+    println!("removed: {target}");
+    Ok(0)
+}
+
+fn cmd_controllers(state: &State, args: &[String]) -> Result<i32> {
+    no_args(args)?;
+    let runtime = state.load("runtime.json", json!({}));
+    let agents = runtime.get("agents").and_then(Value::as_array);
+    let controllers = state.controllers();
+    if controllers.is_empty() {
+        println!(
+            "(尚未登记塔台管制员；在管制员 Agent 中运行 ./fleet controller-register --current)"
+        );
+        return Ok(0);
+    }
+    for controller in controllers {
+        let session = optional_string(&controller, "agent_session_id");
+        let target = string(&controller, "target");
+        let live = agents.into_iter().flatten().find(|agent| {
+            session
+                .as_deref()
+                .zip(agent_session_id(agent).as_deref())
+                .is_some_and(|(left, right)| left == right)
+                || agent.get("name").and_then(Value::as_str) == Some(target.as_str())
+                || agent.get("pane_id").and_then(Value::as_str) == Some(target.as_str())
+        });
+        println!(
+            "{} · {} · {}",
+            string(&controller, "id"),
+            controller_role_label(&string(&controller, "role")),
+            live.map(|agent| string(agent, "agent_status"))
+                .unwrap_or_else(|| "offline".into())
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_deliveries(state: &State, args: &[String]) -> Result<i32> {
+    if !(args.is_empty() || args.len() == 1 && args[0] == "--all") {
+        bail!(USAGE)
+    }
+    crate::dispatch::reconcile(state)?;
+    let all = !args.is_empty();
+    let deliveries: Vec<Value> = state
+        .deliveries()
+        .into_iter()
+        .filter(|item| all || string(item, "state") != "acknowledged")
+        .collect();
+    if deliveries.is_empty() {
+        println!("(没有等待处理的塔台事件)");
+        return Ok(0);
+    }
+    for item in deliveries {
+        println!(
+            "{} · {} · {} · {}",
+            string(&item, "id"),
+            string(&item, "state"),
+            string(&item, "project"),
+            string(&item, "summary")
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_delivery_ack(state: &State, args: &[String]) -> Result<i32> {
+    if args.len() != 1 {
+        bail!(USAGE)
+    }
+    crate::dispatch::acknowledge(state, &args[0])?;
+    println!("acknowledged: {}", args[0]);
+    Ok(0)
+}
+
+fn cmd_delivery_release(state: &State, args: &[String]) -> Result<i32> {
+    if args.len() != 1 {
+        bail!(USAGE)
+    }
+    crate::dispatch::release(state, &args[0])?;
+    println!("released: {}", args[0]);
+    Ok(0)
+}
+
+fn cmd_dispatch(state: &State, args: &[String]) -> Result<i32> {
+    no_args(args)?;
+    match crate::dispatch::dispatch_one(state)? {
+        Some(id) => println!("dispatched: {id}"),
+        None => println!("(没有可派送事件，或当前没有空闲管制员)"),
+    }
+    Ok(0)
+}
+
 fn cmd_open(args: &[String]) -> Result<i32> {
     no_args(args)?;
     let plugin_id = env::var("HERDR_PLUGIN_ID").unwrap_or_else(|_| crate::state::PLUGIN_ID.into());
@@ -1299,5 +1639,65 @@ mod tests {
         let attention = state.refresh_attention().unwrap();
         assert_eq!(attention[0]["kind"], "decision_required");
         assert!(attention.iter().any(|item| item["kind"] == "stale_blocked"));
+    }
+
+    #[test]
+    fn controller_pool_assigns_the_recommended_three_roles() {
+        let (_temporary, state) = fixture();
+        state
+            .write_runtime(
+                &json!({"agents": [
+                    {"pane_id": "w1:p10", "agent_status": "working", "agent_session": {"value": "s1"}},
+                    {"pane_id": "w1:p11", "agent_status": "working", "agent_session": {"value": "s2"}},
+                    {"pane_id": "w1:p12", "agent_status": "working", "agent_session": {"value": "s3"}},
+                    {"pane_id": "w1:p13", "agent_status": "working", "agent_session": {"value": "s4"}}
+                ]}),
+                true,
+                None,
+                "test",
+                None,
+            )
+            .unwrap();
+        for pane in ["w1:p10", "w1:p11", "w1:p12"] {
+            run(&state, &strings(&["controller-register", pane])).unwrap();
+        }
+        let roles: Vec<String> = state
+            .controllers()
+            .iter()
+            .map(|item| string(item, "role"))
+            .collect();
+        assert_eq!(roles, ["primary", "research", "verification"]);
+        assert!(run(
+            &state,
+            &strings(&["controller-register", "w1:p13", "--role", "standby"])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unregistering_a_controller_releases_its_delivery() {
+        let (_temporary, state) = fixture();
+        state
+            .write_json(
+                "controllers.json",
+                &json!([{"id": "controller-one", "target": "w1:p10", "role": "primary"}]),
+            )
+            .unwrap();
+        state
+            .write_json(
+                "deliveries.json",
+                &json!([{
+                    "id": "delivery-one", "state": "leased",
+                    "assigned_controller": "controller-one", "lease_expires_at_ms": utc_ms() + 60_000
+                }]),
+            )
+            .unwrap();
+        run(
+            &state,
+            &strings(&["controller-unregister", "controller-one"]),
+        )
+        .unwrap();
+        assert_eq!(state.deliveries()[0]["state"], "pending");
+        assert!(state.deliveries()[0]["assigned_controller"].is_null());
     }
 }

@@ -4,7 +4,7 @@
 
 ## 发布步骤
 
-1. 同时修改两个 manifest 的版本，例如 `0.3.1`。
+1. 同时修改两个 manifest 的版本，例如 `0.4.0`。
 2. 运行本地发布检查：
 
    ```bash
@@ -18,8 +18,8 @@
 4. 创建 annotated tag 并只推送该 tag：
 
    ```bash
-   git tag -a v0.3.1 -m "v0.3.1"
-   git push origin v0.3.1
+   git tag -a v0.4.0 -m "v0.4.0"
+   git push origin v0.4.0
    ```
 
 5. `release.yml` 校验三个版本，构建四个平台，生成 SHA-256 校验和并创建 GitHub Release。

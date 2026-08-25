@@ -58,6 +58,33 @@ struct Agent {
     agent_status: String,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    pane_id: String,
+    #[serde(default)]
+    agent_session: Option<AgentSession>,
+}
+
+#[derive(Clone, Deserialize, Default)]
+struct AgentSession {
+    #[serde(default)]
+    value: String,
+}
+
+#[derive(Clone, Deserialize, Default)]
+struct ControllerEntry {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    agent_session_id: Option<String>,
+}
+
+struct Controller {
+    entry: ControllerEntry,
+    status: String,
 }
 
 #[derive(Clone, Deserialize, Default)]
@@ -122,6 +149,8 @@ struct App {
     decisions: Vec<Decision>,
     attention: Vec<Attention>,
     inbox: Vec<Inbox>,
+    controllers: Vec<Controller>,
+    pending_deliveries: usize,
     cursor: usize,
     agents: Vec<Agent>,
     connected: bool,
@@ -143,6 +172,8 @@ impl App {
             decisions: vec![],
             attention: vec![],
             inbox: vec![],
+            controllers: vec![],
+            pending_deliveries: 0,
             cursor: 0,
             agents: vec![],
             connected: false,
@@ -207,6 +238,40 @@ impl App {
         } else {
             vec![]
         };
+        let controller_entries: Vec<ControllerEntry> =
+            serde_json::from_value(self.state.load("controllers.json", serde_json::json!([])))
+                .unwrap_or_default();
+        self.controllers = controller_entries
+            .into_iter()
+            .map(|entry| {
+                let live = self.agents.iter().find(|agent| {
+                    entry
+                        .agent_session_id
+                        .as_deref()
+                        .zip(
+                            agent
+                                .agent_session
+                                .as_ref()
+                                .map(|session| session.value.as_str()),
+                        )
+                        .is_some_and(|(left, right)| left == right)
+                        || agent.name.as_deref() == Some(entry.target.as_str())
+                        || agent.pane_id == entry.target
+                });
+                Controller {
+                    entry,
+                    status: live
+                        .map(|agent| agent.agent_status.clone())
+                        .unwrap_or_else(|| "offline".into()),
+                }
+            })
+            .collect();
+        self.pending_deliveries = self
+            .state
+            .deliveries()
+            .iter()
+            .filter(|item| item["state"].as_str() != Some("acknowledged"))
+            .count();
 
         let decisions = self.state.decisions();
         let runtime_projects = runtime.get("projects").and_then(Value::as_object);
@@ -312,6 +377,25 @@ impl App {
             self.message = "收件箱已读".into();
         }
     }
+
+    fn dispatch(&mut self) {
+        self.message = match crate::dispatch::dispatch_one(&self.state) {
+            Ok(Some(id)) => format!("已派送 {id}"),
+            Ok(None) => "没有可派送事件，或当前没有空闲管制员".into(),
+            Err(error) => format!("派送失败：{error}"),
+        };
+        self.load();
+    }
+}
+
+fn controller_role_label(role: &str) -> &'static str {
+    match role {
+        "primary" => "主管制",
+        "research" => "调查",
+        "verification" => "验证",
+        "standby" => "备用",
+        _ => "管制",
+    }
 }
 
 fn status_color(status: &str) -> Color {
@@ -408,6 +492,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let inbox_h = (app.inbox.len().min(4) as u16 + 2).max(3);
     let rows = Layout::vertical([
         Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(decision_h),
         Constraint::Length(attention_h),
         Constraint::Min(7),
@@ -449,6 +534,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 AMBER
             }),
         ),
+        Span::styled(
+            format!("   {} 条待投递", app.pending_deliveries),
+            Style::default().fg(if app.pending_deliveries == 0 {
+                DIM
+            } else {
+                AMBER
+            }),
+        ),
     ];
     if app.connected {
         header.push(Span::styled(
@@ -470,6 +563,46 @@ fn draw(frame: &mut Frame, app: &mut App) {
             height: 1,
             ..rows[0]
         },
+    );
+
+    let controller_lines = if app.controllers.is_empty() {
+        vec![Line::from(Span::styled(
+            "尚未登记管制员。在塔台 Agent 中运行 ./fleet controller-register --current",
+            Style::default().fg(AMBER),
+        ))]
+    } else {
+        vec![Line::from(
+            app.controllers
+                .iter()
+                .flat_map(|controller| {
+                    vec![
+                        dot(&controller.status),
+                        Span::styled(
+                            format!(
+                                " {} {}  ",
+                                controller_role_label(&controller.entry.role),
+                                controller.entry.id
+                            ),
+                            Style::default().fg(if controller.status == "offline" {
+                                RED
+                            } else {
+                                FG
+                            }),
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        )]
+    };
+    frame.render_widget(
+        Paragraph::new(controller_lines).block(section(format!(
+            "管制席 · {} 在线",
+            app.controllers
+                .iter()
+                .filter(|controller| controller.status != "offline")
+                .count()
+        ))),
+        rows[1],
     );
 
     if decision_h > 0 {
@@ -505,7 +638,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(
             Paragraph::new(lines)
                 .block(section("等你拍板").border_style(Style::default().fg(AMBER))),
-            rows[1],
+            rows[2],
         );
     }
 
@@ -556,7 +689,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(attention_lines)
             .block(section(format!("需要介入 · {}", app.attention.len())))
             .wrap(Wrap { trim: true }),
-        rows[2],
+        rows[3],
     );
 
     let project_items: Vec<ListItem> = if app.projects.is_empty() {
@@ -643,12 +776,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .iter()
         .map(|item| item.height() as u16)
         .collect();
-    app.project_area = rows[3];
+    app.project_area = rows[4];
     frame.render_stateful_widget(
         List::new(project_items)
             .block(section("项目"))
             .highlight_style(Style::default().bg(SEL_BG)),
-        rows[3],
+        rows[4],
         &mut app.selected,
     );
 
@@ -687,18 +820,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
             })
             .collect()
     };
-    app.inbox_area = rows[4];
+    app.inbox_area = rows[5];
     frame.render_widget(
         Paragraph::new(inbox_lines).block(section(if unread > 0 {
             format!("最近事件 · {unread} 未读")
         } else {
             "最近事件".into()
         })),
-        rows[4],
+        rows[5],
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "↑↓/jk 选择   Enter 展开   r 对账   a 重建注意力   m 全部已读   q 关闭{}",
+            "↑↓/jk 选择   Enter 展开   r 对账   a 重建注意力   d 派送   m 全部已读   q 关闭{}",
             if app.message.is_empty() {
                 String::new()
             } else {
@@ -706,7 +839,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             }
         ))
         .style(Style::default().fg(DIM)),
-        rows[5],
+        rows[6],
     );
 }
 
@@ -766,6 +899,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
                         };
                         app.load();
                     }
+                    KeyCode::Char('d') => app.dispatch(),
                     KeyCode::Char('m') => app.mark_read(),
                     _ => {}
                 },

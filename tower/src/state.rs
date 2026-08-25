@@ -156,6 +156,8 @@ impl State {
                 ("decisions.json", json!([])),
                 ("claims.json", json!([])),
                 ("attention.json", json!([])),
+                ("controllers.json", json!([])),
+                ("deliveries.json", json!([])),
             ] {
                 if !self.path(name).exists() {
                     self.write_json(name, &default)?;
@@ -167,6 +169,23 @@ impl State {
                 .open(self.path("inbox.jsonl"))?;
             if !self.path("inbox.cursor").exists() {
                 fs::write(self.path("inbox.cursor"), "0")?;
+            }
+            if !self.path("delivery-state.json").exists() {
+                let attention = self
+                    .load("attention.json", json!([]))
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                self.write_json(
+                    "delivery-state.json",
+                    &json!({
+                        "inbox_offset": self.inbox_entries().len(),
+                        "attention_active": attention
+                            .iter()
+                            .filter_map(crate::dispatch::attention_source_key)
+                            .collect::<Vec<_>>()
+                    }),
+                )?;
             }
             Ok(())
         })
@@ -207,6 +226,20 @@ impl State {
 
     pub fn claims(&self) -> Vec<Value> {
         self.load("claims.json", json!([]))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn controllers(&self) -> Vec<Value> {
+        self.load("controllers.json", json!([]))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn deliveries(&self) -> Vec<Value> {
+        self.load("deliveries.json", json!([]))
             .as_array()
             .cloned()
             .unwrap_or_default()
@@ -302,6 +335,9 @@ impl State {
                 "attention.json",
                 "inbox.jsonl",
                 "inbox.cursor",
+                "controllers.json",
+                "deliveries.json",
+                "delivery-state.json",
                 "dispatch.json",
                 "summaries.json",
             ] {

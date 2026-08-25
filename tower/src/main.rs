@@ -1,4 +1,5 @@
 mod commands;
+mod dispatch;
 mod state;
 mod ui;
 mod watch;

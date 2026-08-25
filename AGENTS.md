@@ -8,7 +8,7 @@ Reasoning effort is set to xhigh. Think carefully, validate key assumptions, and
 
 创建、排布、启动或排查 fleet 前，必须先读 [`docs/FLEET-OPERATIONS.md`](docs/FLEET-OPERATIONS.md)。该文档包含机组编制、pane 布局、命名、启动参数、身份注入和 blocked 故障处置等强制规则。
 
-本文件规定 v0.2 的运行模式、可信状态和注意力协议；它优先于旧操作手册中关于 watcher、三层状态和唤醒流程的旧说明。
+本文件规定 v0.4 的运行模式、可信状态、注意力协议和管制席投递；它优先于旧操作手册中关于 watcher、三层状态和唤醒流程的旧说明。
 
 ## 核心边界
 
@@ -17,6 +17,30 @@ Reasoning effort is set to xhigh. Think carefully, validate key assumptions, and
 - 所有项目指令只通过 `./fleet route <项目> "..."` 发给注册表中的唯一机长；不要越级指挥 reviewer 或 crew。
 - 塔台只维护跨上下文恢复需要的最小事实：项目、机长、运行时观察、业务声明、机器证据、用户决策、最终验收和注意力队列。
 - 不把对话记忆当状态源。需要恢复的事实必须落盘。
+
+## 塔台管制席
+
+本仓库目录中运行的 Agent 是塔台的自然语言管制员。每个管制员会话首次开始工作时，先执行：
+
+```bash
+./fleet controller-register --current
+```
+
+默认最多登记 3 个席位，并按顺序分配：
+
+1. `primary`：主管制员，负责主要用户对话、建组、路由和决策；
+2. `research`：上下文调查员，负责开工前只读调查，并优先处理原因不明的阻塞；
+3. `verification`：验证管制员，优先处理完成声明、机器验证和证据检查。
+
+单个管制员自动承担全部职责。多席位是注意力分工，不是多机长：创建 fleet 前可以协作调查；fleet 注册后仍只通过项目唯一机长进入执行层。
+
+管制员收到 `[Herdr 塔台事件 <delivery-id>]` 后，按本文件的标准流程核对事实、向用户汇报并推进下一步。处理完成后必须运行：
+
+```bash
+./fleet delivery-ack <delivery-id>
+```
+
+尚不能处理时运行 `./fleet delivery-release <delivery-id>`，使事件立即回到队列。不要在尚未向用户说明、尚未记录下一步或仍需等待外部结果时提前确认。
 
 ## 状态目录与运行模式
 
@@ -82,11 +106,13 @@ verified done   != accepted done
 ## 每次被唤醒的标准流程
 
 1. 确认处于 Herdr 环境，需要控制 pane 时加载 herdr skill。
-2. 运行 `./fleet list`，检查注册表、机长在线状态和当前 claim。
-3. 运行 `./fleet attention`，先处理优先级最高的人类介入事项。
-4. 运行 `./fleet decisions`，查看正式待拍板事项。
-5. 运行 `./fleet inbox`，读取增量事件并推进游标。
-6. 用大白话向用户汇报，然后按用户指令用 `./fleet route`、`resolve`、`verify` 或 `accept` 处理。
+2. 运行 `./fleet controller-register --current`，幂等恢复当前管制席身份。
+3. 运行 `./fleet list`，检查注册表、机长在线状态和当前 claim。
+4. 运行 `./fleet attention`，先处理优先级最高的人类介入事项。
+5. 运行 `./fleet decisions`，查看正式待拍板事项。
+6. 运行 `./fleet inbox`，读取增量事件并推进游标。
+7. 用大白话向用户汇报，然后按用户指令用 `./fleet route`、`resolve`、`verify` 或 `accept` 处理。
+8. 如果本次是投递唤醒，完成上述处理后执行消息中给出的 `delivery-ack`。
 
 不要每次唤醒都轮询所有 pane。只有 attention 指向“阻塞原因不明”、状态矛盾或需要读现场时，才执行 `herdr agent read <name>`。
 

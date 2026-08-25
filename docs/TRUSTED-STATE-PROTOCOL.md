@@ -67,3 +67,24 @@ status mismatch
 ```
 
 Consumers should use `fleet attention --json` or `attention.json`; they should not independently infer decisions from raw `blocked` events.
+
+## Controller delivery protocol
+
+Attention remains a projection. Delivery is a separate reliability mechanism that wakes a conversational tower controller without changing the underlying fact authority.
+
+Two sources create deliveries:
+
+- explicit durable events appended by `fleet report`, `ask`, `verify`, `resolve`, and `accept`;
+- transitions into runtime-derived attention such as commander offline, unexplained block, runtime loss, and project/runtime mismatch.
+
+Every source has a stable key. `delivery-state.json` stores the append-only inbox offset and the currently active runtime-attention keys, so repeated Plugin reconciliation does not create duplicate work. `deliveries.json` stores delivery state:
+
+```text
+pending ── select one idle controller ──> leased ── controller ack ──> acknowledged
+   ▲                                      │
+   └──── send failure / release / expiry ─┘
+```
+
+A lease lasts five minutes. The controller identity is tied to the Herdr agent-session identity when available, so moving a pane does not transfer an active control seat to an unrelated process. File locking prevents two concurrent Plugin hooks from leasing the same event.
+
+The dispatcher prefers `research` for unexplained blocking and state mismatch, `verification` for completion and verification work, and `primary` for governance and general progress. These are attention-routing preferences only; they do not grant a controller authority over project crew.

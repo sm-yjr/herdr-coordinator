@@ -1,6 +1,6 @@
 id = "sm-yjr.herdr-coordinator"
 name = "Herdr Coordinator"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.8.0"
 description = "Human-in-the-loop supervisory control plane for long-running coding-agent fleets."
 platforms = ["linux", "macos"]
@@ -24,6 +24,13 @@ title = "Reconcile Fleet Runtime"
 description = "Refresh the coordinator runtime projection from a Herdr snapshot."
 contexts = ["workspace", "pane"]
 command = ["./bin/herdr-coordinator", "plugin-reconcile"]
+
+[[actions]]
+id = "dispatch"
+title = "Retry Tower Event Delivery"
+description = "Deliver the highest-priority pending event to an idle tower controller."
+contexts = ["workspace", "pane"]
+command = ["./bin/herdr-coordinator", "dispatch"]
 
 [[panes]]
 id = "tower"

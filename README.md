@@ -24,6 +24,70 @@ fleet ask / accept     ──> decisions.json governed：用户决策与最终�
 
 实时 `blocked` 不等于正式 `need_decision`；机长声称 `done` 也不等于已经通过验证或用户验收。
 
+## 推荐使用方式：一个塔台 Tab
+
+Herdr Coordinator 的主要交互入口是运行在本仓库目录中的 **塔台 Agent**，不是 Ratatui 浮层。建议创建一个塔台 Tab，在其中启动 1～3 个 Agent；它们读取本仓库的 `AGENTS.md`，接收操作者的自然语言目标，在开工前补充项目上下文，然后按 `docs/FLEET-OPERATIONS.md` 创建独立项目 Tab 和机组。
+
+每个塔台 Agent 启动后自登记一次：
+
+```bash
+./fleet controller-register --current
+```
+
+`--role auto` 是默认值。三个席位按登记顺序采用以下分工：
+
+1. **主管制员（primary）**：操作者的主要对话入口，负责创建机组、路由指令和处理用户决策；
+2. **上下文调查员（research）**：开工前只读调查项目，也优先接收阻塞原因不明和状态矛盾事件；
+3. **验证管制员（verification）**：优先处理机长的完成声明、验证命令和证据检查。
+
+只有一个 Agent 时，它自动成为主管制员并处理所有事件。角色是调度偏好，不改变权限边界；所有项目指令仍然只交给唯一机长。需要显式指定时：
+
+```bash
+./fleet controller-register --current --role primary
+./fleet controller-register --current --role research
+./fleet controller-register --current --role verification
+./fleet controllers
+```
+
+### 从自然语言目标到机组
+
+操作者只需要在塔台 Tab 中说明目标，例如：
+
+```text
+调查 /path/to/demo 当前的测试和发布方式，然后建立一个 1-1-3 机组完成配置迁移。
+验收条件是单元测试通过、旧配置可迁移，并给出可审查的提交。
+```
+
+管制员负责完成一次性建组工作：收集必要上下文、创建项目 Tab、排布 Pane、启动并注入机组身份、登记唯一机长、发送自包含开工目标。建组完成后，管制员不再管理 Worker；后续指令通过 `fleet route` 交给机长。
+
+### 事件怎样回到塔台
+
+重要变化会进入 Rust 实现的耐久投递队列：
+
+```text
+Herdr 生命周期事件 ─┐
+机长 report / ask ──┼─> attention + deliveries ─> 租给一个空闲管制员
+验证与用户验收 ─────┘                              │
+                                                   └─> 管制员在塔台 Tab 汇报
+```
+
+每条事件只会同时租给一个管制员。默认租约为 5 分钟；管制员掉线、发送失败或租约超时后，事件重新等待派送。管制员处理并记录下一步后确认：
+
+```bash
+./fleet delivery-ack <delivery-id>
+```
+
+诊断和手工恢复命令：
+
+```bash
+./fleet deliveries          # 未确认事件
+./fleet deliveries --all    # 包括历史确认记录
+./fleet dispatch            # 立即尝试派给一个空闲管制员
+./fleet delivery-release <delivery-id>
+```
+
+生命周期的普通抖动只更新运行时投影；机长显式汇报、待拍板、完成、验证结果、异常离线、持续阻塞和状态矛盾才会唤醒管制员，避免塔台被低价值事件淹没。
+
 ## 作为 Herdr plugin 安装
 
 要求：Herdr 0.8.0 或更高版本，主机为 macOS 或 Linux。正式安装优先使用 GitHub Release 中经过校验的预编译 Rust 二进制；没有匹配产物时才需要本机 Rust toolchain。
@@ -49,7 +113,7 @@ Plugin 提供：
 - Herdr 启动后的 snapshot 对账；
 - pane / tab / workspace / Agent 状态事件触发的增量重对账；
 - `Fleet Control Tower` overlay；
-- `open` 与 `reconcile` 两个 action；
+- `open`、`reconcile` 与 `dispatch` 三个 action；
 - Herdr 管理的独立 config/state 目录；
 - 首次启动时从独立模式的 `~/.herdr-coordinator/` 一次性导入耐久状态。
 
@@ -59,7 +123,7 @@ Plugin startup 是一次性恢复，不运行常驻 daemon。事件 hook 可能�
 
 仓库根目录的 `./fleet` 是统一入口：plugin 进程直接使用 Herdr 注入的 state 目录；普通 commander/crew pane 没有 plugin 环境变量时，入口会自动发现已安装 plugin 的 state 目录。因此机长汇报、Ratatui overlay、event hook 和命令行查看共享同一个状态源，不会形成两份状态。生产逻辑全部位于 `tower/src/`，由同一个 `herdr-coordinator` Rust 二进制提供。
 
-Ratatui 浮层以“等你拍板 → 需要介入 → 项目 → 最近事件”为信息层级，支持方向键或 `j/k` 选择、`Enter` 展开项目、`r` 重新对账、`a` 重建注意力、`m` 标记已读、`q` 关闭。
+Ratatui 浮层是状态看板，不代替塔台 Agent。它以“管制席 → 等你拍板 → 需要介入 → 项目 → 最近事件”为信息层级，支持方向键或 `j/k` 选择、`Enter` 展开项目、`r` 重新对账、`a` 重建注意力、`d` 重试派送、`m` 标记已读、`q` 关闭。
 
 ## 快速开始
 
@@ -195,6 +259,8 @@ fleet report / claims / verify / accept
 fleet ask / decisions / resolve
 fleet attention
 fleet inbox
+fleet controller-register / controller-unregister / controllers
+fleet deliveries / delivery-ack / delivery-release / dispatch
 fleet sync
 fleet plugin-reconcile / plugin-event
 fleet watch-start / watch-status / watch-stop
@@ -210,6 +276,9 @@ claims.json       状态声明、机器证据、验收记录
 decisions.json    待拍板事项与解决记录
 runtime.json      Herdr snapshot/event 的实时投影
 attention.json    排序后的人工介入队列
+controllers.json  1～3 个塔台管制席、角色和稳定 Agent 会话身份
+deliveries.json   待处理、租约中和已确认的耐久事件
+delivery-state.json 投递队列的增量游标与注意力去重状态
 legacy-import.json 独立模式状态的一次性导入记录
 inbox.jsonl       状态、验证、决策和验收事件历史
 inbox.cursor      收件箱已读位置
@@ -235,8 +304,8 @@ CI 在 Linux 和 macOS 上执行格式、Clippy、测试和 release build。
 `herdr-plugin.toml` 与 `tower/Cargo.toml` 使用同一个 SemVer。发布时只推送匹配版本的 tag：
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 GitHub Actions 会拒绝 tag、plugin 版本和 crate 版本不一致的发布。验证通过后，它会构建 macOS/Linux 的 Intel 与 ARM 四个平台，生成 `checksums.txt` 并创建 GitHub Release。`herdr plugin install` 的 build hook 会下载并校验对应二进制；Release 缺失或平台不匹配时才回退到本地 `cargo build --locked --release`。
