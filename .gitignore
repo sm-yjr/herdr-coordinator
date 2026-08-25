@@ -3,10 +3,7 @@
 
 # Rust build artifacts
 tower/target/
+/bin/
 
 # Pi agent session data
 .pi/
-
-# Python bytecode
-__pycache__/
-*.py[cod]

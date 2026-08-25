@@ -26,7 +26,7 @@ fleet ask / accept     ──> decisions.json governed：用户决策与最终�
 
 ## 作为 Herdr plugin 安装
 
-要求：Herdr 0.8.2 或更高版本、Python 3.9+，主机为 macOS 或 Linux。
+要求：Herdr 0.8.0 或更高版本，主机为 macOS 或 Linux。正式安装优先使用 GitHub Release 中经过校验的预编译 Rust 二进制；没有匹配产物时才需要本机 Rust toolchain。
 
 ```bash
 herdr plugin install sm-yjr/herdr-coordinator
@@ -38,6 +38,8 @@ herdr plugin action invoke open --plugin sm-yjr.herdr-coordinator
 ```bash
 git clone https://github.com/sm-yjr/herdr-coordinator.git
 cd herdr-coordinator
+cargo build --release --locked --manifest-path tower/Cargo.toml
+mkdir -p bin && cp tower/target/release/herdr-coordinator bin/
 herdr plugin link "$(pwd)"
 herdr plugin action invoke open --plugin sm-yjr.herdr-coordinator
 ```
@@ -55,7 +57,9 @@ Plugin 提供：
 
 Plugin startup 是一次性恢复，不运行常驻 daemon。事件 hook 可能并发执行，因此每个 hook 都在文件锁内重新读取一次权威 snapshot，而不是直接相信可能乱序到达的事件 payload。snapshot 调用默认 15 秒超时，可用 `HERDR_SNAPSHOT_TIMEOUT` 调整。
 
-仓库根目录的 `./fleet` 是统一入口：plugin 进程直接使用 Herdr 注入的 state 目录；普通 commander/crew pane 没有 plugin 环境变量时，入口会自动发现已安装 plugin 的 state 目录。因此机长汇报、overlay、event hook 和命令行查看共享同一个状态源，不会形成一份 plugin 状态和一份 `~/.herdr-coordinator` 状态。内部实现位于 `fleet_core.py`，入口级超时与治理约束位于 `fleet_policy.py`；不要绕过根命令直接调用内部文件。
+仓库根目录的 `./fleet` 是统一入口：plugin 进程直接使用 Herdr 注入的 state 目录；普通 commander/crew pane 没有 plugin 环境变量时，入口会自动发现已安装 plugin 的 state 目录。因此机长汇报、Ratatui overlay、event hook 和命令行查看共享同一个状态源，不会形成两份状态。生产逻辑全部位于 `tower/src/`，由同一个 `herdr-coordinator` Rust 二进制提供。
+
+Ratatui 浮层以“等你拍板 → 需要介入 → 项目 → 最近事件”为信息层级，支持方向键或 `j/k` 选择、`Enter` 展开项目、`r` 重新对账、`a` 重建注意力、`m` 标记已读、`q` 关闭。
 
 ## 快速开始
 
@@ -98,7 +102,7 @@ Plugin 模式不需要 `watch-start`。
 ```bash
 ./fleet verify demo \
   --label unit-tests \
-  -- python3 -m unittest discover -s tests -v
+  -- cargo test --manifest-path tower/Cargo.toml
 ```
 
 验证命令的退出码、耗时以及 stdout/stderr 尾部会写入本地 `claims.json`。不要让验证命令把密钥或敏感日志输出到终端。
@@ -217,14 +221,27 @@ watch.pid/log     独立 watcher 的兼容状态
 ## 开发与验证
 
 ```bash
-python3 -m py_compile fleet fleet_core.py fleet_policy.py scripts/plugin_runtime.py tower/plugin_tower.py
-python3 -m unittest discover -s tests -v
-bash -n scripts/open-tower.sh
-bash -n dashboard.sh
-cargo check --manifest-path tower/Cargo.toml
+cargo fmt --manifest-path tower/Cargo.toml --all --check
+cargo clippy --manifest-path tower/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path tower/Cargo.toml --all-targets
+cargo build --manifest-path tower/Cargo.toml --release --locked
+bash -n fleet dashboard.sh scripts/fetch-or-build.sh
 ```
 
-CI 在 Linux 和 macOS 上执行 Python、Shell 和 Rust 检查。
+CI 在 Linux 和 macOS 上执行格式、Clippy、测试和 release build。
+
+## 版本与发布
+
+`herdr-plugin.toml` 与 `tower/Cargo.toml` 使用同一个 SemVer。发布时只推送匹配版本的 tag：
+
+```bash
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+GitHub Actions 会拒绝 tag、plugin 版本和 crate 版本不一致的发布。验证通过后，它会构建 macOS/Linux 的 Intel 与 ARM 四个平台，生成 `checksums.txt` 并创建 GitHub Release。`herdr plugin install` 的 build hook 会下载并校验对应二进制；Release 缺失或平台不匹配时才回退到本地 `cargo build --locked --release`。
+
+完整发布检查和失败处理见 [`docs/RELEASING.md`](docs/RELEASING.md)。
 
 ## 设计边界
 

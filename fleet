@@ -1,73 +1,16 @@
-#!/usr/bin/env python3
-"""Resolve shared state, install runtime guards, and dispatch fleet commands."""
+#!/usr/bin/env bash
+set -euo pipefail
 
-from __future__ import annotations
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-import importlib.util
-import os
-from pathlib import Path
-import sys
-from types import ModuleType
+if [ -x "$root/bin/herdr-coordinator" ]; then
+  exec "$root/bin/herdr-coordinator" "$@"
+fi
 
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "未找到 herdr-coordinator 二进制；请先运行 scripts/fetch-or-build.sh" >&2
+  exit 127
+fi
 
-PLUGIN_ID = "sm-yjr.herdr-coordinator"
-ROOT = Path(__file__).resolve().parent
-CORE_PATH = ROOT / "fleet_core.py"
-
-
-def plugin_state_candidates() -> list[Path]:
-    if value := os.environ.get("XDG_STATE_HOME"):
-        base = Path(value).expanduser()
-    else:
-        base = Path.home() / ".local" / "state"
-    # Stable Herdr uses `herdr`; local debug builds use `herdr-dev`.
-    return [base / app / "plugins" / PLUGIN_ID for app in ("herdr", "herdr-dev")]
-
-
-def resolve_state_environment() -> None:
-    # Explicit caller choices always win.
-    if os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.environ.get(
-        "HERDR_COORDINATOR_HOME"
-    ):
-        return
-    for candidate in plugin_state_candidates():
-        if candidate.is_dir():
-            os.environ["HERDR_PLUGIN_STATE_DIR"] = str(candidate)
-            os.environ.setdefault("HERDR_PLUGIN_ID", PLUGIN_ID)
-            return
-
-
-def load_core() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("herdr_coordinator_fleet_core", CORE_PATH)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"无法加载控制面实现: {CORE_PATH}")
-    core = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(core)
-    return core
-
-
-def main() -> None:
-    resolve_state_environment()
-    # The compatibility watcher verifies its PID by matching fleet_core.py in the
-    # process command. Preserve that identity for the foreground watch command.
-    if len(sys.argv) > 1 and sys.argv[1] == "watch":
-        if os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.environ.get("HERDR_PLUGIN_ID"):
-            raise SystemExit("Plugin 模式由 Herdr startup/event hooks 维护实时状态，无需 fleet watch")
-        os.execv(sys.executable, [sys.executable, str(CORE_PATH), *sys.argv[1:]])
-    core = load_core()
-    from fleet_policy import install
-
-    install(core)
-    if len(sys.argv) < 2 or sys.argv[1] not in core.COMMANDS:
-        print(core.__doc__)
-        raise SystemExit(1)
-    try:
-        core.migrate_legacy_state()
-        core.COMMANDS[sys.argv[1]](sys.argv[2:])
-    except IndexError:
-        print(core.__doc__)
-        raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()
+cargo build --quiet --locked --release --manifest-path "$root/tower/Cargo.toml"
+exec "$root/tower/target/release/herdr-coordinator" "$@"

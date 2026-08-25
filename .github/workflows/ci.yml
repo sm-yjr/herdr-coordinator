@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  validate:
+  rust:
     strategy:
       fail-fast: false
       matrix:
@@ -14,17 +14,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: "3.11"
-      - name: Python syntax
-        run: python3 -m py_compile fleet fleet_core.py fleet_policy.py scripts/plugin_runtime.py tower/plugin_tower.py
-      - name: Unit tests
-        run: python3 -m unittest discover -s tests -v
-      - name: Shell syntax
-        run: |
-          bash -n scripts/open-tower.sh
-          bash -n dashboard.sh
-          bash -n dashboard_core.sh
-      - name: Rust check
-        run: cargo check --manifest-path tower/Cargo.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tower
+      - name: Format
+        run: cargo fmt --manifest-path tower/Cargo.toml --all --check
+      - name: Clippy
+        run: cargo clippy --manifest-path tower/Cargo.toml --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --manifest-path tower/Cargo.toml --all-targets
+      - name: Release build
+        run: cargo build --manifest-path tower/Cargo.toml --release --locked
+      - name: Launcher syntax
+        run: bash -n fleet dashboard.sh scripts/fetch-or-build.sh
+      - name: No Python runtime
+        run: test -z "$(find . -path './tower/target' -prune -o -name '*.py' -print)"

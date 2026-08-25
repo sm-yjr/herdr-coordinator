@@ -14,11 +14,12 @@ Reasoning effort is set to xhigh. Please think carefully through the task, valid
 
 ## 注册表与收件箱
 
-数据在 `~/.herdr-coordinator/`，用本项目的 `./fleet` 脚本操作：
+状态优先保存在 Herdr 分配的 plugin state 目录；未安装 plugin 时回退到 `~/.herdr-coordinator/`。统一用本项目的 `./fleet` 启动 Rust 控制面：
 
 ```bash
-./fleet watch-start                             # 启动 Herdr socket 事件监听器（幂等）
-./fleet watch-status                            # 检查事件监听器连接状态
+./fleet plugin-reconcile                        # Plugin 模式下主动重新读取权威 snapshot
+./fleet watch-start                             # 仅独立兼容模式启动 socket watcher
+./fleet watch-status                            # 查看当前事件模式
 ./fleet list                                    # 注册表 + 事件缓存对账（每次唤醒先跑这个）
 ./fleet inbox                                   # 读机长汇报的增量（读完自动标已读）
 ./fleet decisions                               # 查看所有尚未解决的待拍板事项
@@ -51,7 +52,7 @@ Reasoning effort is set to xhigh. Please think carefully through the task, valid
 ## 每次被唤醒的标准流程
 
 1. 确认环境：`test "${HERDR_ENV:-}" = 1`，需要控制 pane 时加载 **herdr** skill。
-2. `./fleet watch-start` 确保事件监听器运行，再用 `./fleet watch-status` 确认已连接 Herdr。
+2. Plugin 模式由 startup/event hooks 自动维护；只有 runtime 尚未初始化或疑似失真时运行 `./fleet plugin-reconcile`。未安装 plugin 的独立兼容模式才运行 `./fleet watch-start`。
 3. `./fleet list` 对账：注册状态 vs 事件缓存，发现"存活但未注册"或"注册但离线"的要处理。
 4. `./fleet decisions` 查看待拍板事项，再用 `./fleet inbox` 读取增量，把新消息翻译成大白话汇报给用户。
 5. 根据用户指令，用 `./fleet route <项目> "..."` 转发给注册表中的唯一机长。

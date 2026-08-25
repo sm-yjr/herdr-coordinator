@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag and manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME#v}
+          plugin=$(sed -n 's/^version = "\([^"]*\)"/\1/p' herdr-plugin.toml | head -1)
+          crate=$(sed -n 's/^version = "\([^"]*\)"/\1/p' tower/Cargo.toml | head -1)
+          test "$tag" = "$plugin"
+          test "$tag" = "$crate"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tower
+          key: ${{ matrix.target }}
+      - name: Test
+        run: cargo test --manifest-path tower/Cargo.toml --locked
+      - name: Build
+        run: cargo build --manifest-path tower/Cargo.toml --locked --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp "tower/target/${{ matrix.target }}/release/herdr-coordinator" dist/herdr-coordinator
+          tar -C dist -czf "herdr-coordinator-${{ matrix.target }}.tar.gz" herdr-coordinator
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herdr-coordinator-${{ matrix.target }}
+          path: herdr-coordinator-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
